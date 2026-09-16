@@ -1,0 +1,57 @@
+name: Bug report
+description: Report unexpected or incorrect behavior in SecureBrowse.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Security vulnerability?** Do not use this form. Follow the private reporting process in [SECURITY.md](../../SECURITY.md) instead, so the issue is not disclosed publicly before a fix exists.
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands you ran, in order. Use only safe test data (example.com, local test servers) — never real harmful URLs.
+      placeholder: |
+        1. make
+        2. ./bin/proxy &
+        3. ./bin/client http://example.com/
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. Ubuntu 22.04, Kali Linux 2024.1
+    validations:
+      required: true
+  - type: input
+    id: compiler
+    attributes:
+      label: Compiler and version
+      description: Output of `gcc --version` or `clang --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: >
+        Paste any relevant terminal output, proxy logs, or sanitizer reports.
+        Before pasting, remove any secrets, API keys, real hostnames you care about
+        keeping private, or personal data.
+      render: shell

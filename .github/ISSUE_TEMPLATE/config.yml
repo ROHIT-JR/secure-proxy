@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a usage question
+    url: https://github.com/ROHIT-JR/secure-proxy/discussions
+    about: For "how do I..." questions and general discussion. See SUPPORT.md for details.
+  - name: Report a security vulnerability
+    url: https://github.com/ROHIT-JR/secure-proxy/security/advisories/new
+    about: Do not open a public issue for a vulnerability. Use private reporting instead. See SECURITY.md.
