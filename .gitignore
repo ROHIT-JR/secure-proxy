@@ -53,3 +53,40 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build output
+bin/
+build/
+
+# Test/coverage output
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Compilation database
+compile_commands.json
+
+# Local environment / secrets
+.env
+.env.*
+
+# Logs and captures
+*.log
+logs/
+*.pcap
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Sanitizer output
+*.asan
+*.ubsan
+
+# IDE folders
+.vscode/
+.idea/
+*.swp
+

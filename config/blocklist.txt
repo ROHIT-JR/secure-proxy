@@ -1,0 +1,7 @@
+# blocklist.txt
+# One hostname per line. Lines starting with # are comments. Blank lines are ignored.
+# Hostnames are matched case-insensitively after normalisation.
+# Exact host match:
+blocked-example.test
+# A leading dot means "this host and its subdomains" (documented subdomain rule):
+.malicious-example.test
