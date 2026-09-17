@@ -90,3 +90,9 @@ vgcore.*
 .idea/
 *.swp
 
+# Build outputs
+bin/
+*.o
+src/*.o
+*.dSYM/
+
