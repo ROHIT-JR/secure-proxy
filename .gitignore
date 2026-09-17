@@ -1,92 +1,12 @@
-# Prerequisites
-*.d
+# Compiled binaries
+hello_proxy
 
 # Object files
 *.o
-*.ko
-*.obj
-*.elf
+src/*.o
 
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
+# Debug and Sanitizer output
 *.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# debug information files
-*.dwo
-
-# Build output
-bin/
-build/
-
-# Test/coverage output
-*.gcda
-*.gcno
-*.gcov
-coverage/
-
-# Compilation database
-compile_commands.json
-
-# Local environment / secrets
-.env
-.env.*
-
-# Logs and captures
 *.log
-logs/
-*.pcap
-
-# Core dumps
-core
-core.*
 vgcore.*
-
-# Sanitizer output
-*.asan
-*.ubsan
-
-# IDE folders
-.vscode/
-.idea/
-*.swp
-
+core
