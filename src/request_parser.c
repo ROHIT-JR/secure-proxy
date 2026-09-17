@@ -1,4 +1,3 @@
-/* request_parser.c: Implements parse_http_url(), rejecting malformed, oversized, or unsupported request URLs before any network action is taken. */
 #include "request_parser.h"
 #include <string.h>
 #include <ctype.h>
@@ -93,7 +92,7 @@ ParseStatus parse_http_url(const char *raw_url, ParsedUrl *out) {
         for (const char *c = p; c < auth_end; c++) {
             if (*c == ':') {
                 if (colon != NULL) {
-                    return PARSE_ERR_MALFORMED; /* Multiple colons without brackets */
+                    return PARSE_ERR_MALFORMED;
                 }
                 colon = c;
             }
