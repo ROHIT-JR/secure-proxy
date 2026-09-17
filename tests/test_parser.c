@@ -1,8 +1,7 @@
 /* test_parser.c: Unit tests for safe URL parsing and domain normalisation. */
-#include "request_parser.h"
+#include <request_parser.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
 
 static int total_tests = 0;
 static int passed_tests = 0;
@@ -51,7 +50,7 @@ static void test_invalid(const char *url, ParseStatus expected_status) {
 int main(void) {
     printf("=== Running URL Parser Unit Tests ===\n");
 
-    /* 1-13: Valid test cases */
+    /* Valid test cases */
     test_valid("http://example.com/index.html", "example.com", 80, "/index.html");
     test_valid("http://example.com", "example.com", 80, "/");
     test_valid("http://example.com/", "example.com", 80, "/");
@@ -66,7 +65,7 @@ int main(void) {
     test_valid("http://example.com:65535/max-port", "example.com", 65535, "/max-port");
     test_valid("http://example.com:1/min-port", "example.com", 1, "/min-port");
 
-    /* 14-30: Invalid test cases */
+    /* Invalid test cases */
     test_invalid(NULL, PARSE_ERR_MALFORMED);
     test_invalid("", PARSE_ERR_MALFORMED);
     test_invalid("https://example.com/", PARSE_ERR_INVALID_SCHEME);
@@ -84,6 +83,15 @@ int main(void) {
     test_invalid("http://example.com/index.html#section", PARSE_ERR_FRAGMENT);
     test_invalid("http://example.com/newline\n", PARSE_ERR_CONTROL_CHAR);
     test_invalid("http://example.com/spaced path", PARSE_ERR_CONTROL_CHAR);
+
+    /* Test host exceeding 256 bytes buffer */
+    char long_host_url[300];
+    snprintf(long_host_url, sizeof(long_host_url), "http://%s/",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    test_invalid(long_host_url, PARSE_ERR_HOST_TOO_LONG);
 
     printf("Result: %d / %d tests passed successfully.\n", passed_tests, total_tests);
     return (passed_tests == total_tests) ? 0 : 1;

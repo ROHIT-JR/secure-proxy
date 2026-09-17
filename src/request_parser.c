@@ -1,3 +1,4 @@
+/* request_parser.c: Implements parse_http_url(), rejecting malformed, oversized, or unsupported request URLs. */
 #include <request_parser.h>
 #include <string.h>
 #include <ctype.h>
@@ -7,6 +8,7 @@ const char *parse_status_to_string(ParseStatus status) {
     switch (status) {
         case PARSE_OK: return "OK";
         case PARSE_ERR_OVERLONG: return "URL exceeds maximum length (2048 bytes)";
+        case PARSE_ERR_HOST_TOO_LONG: return "Host exceeds maximum length (256 bytes)";
         case PARSE_ERR_INVALID_SCHEME: return "Unsupported or missing URL scheme (only http:// supported)";
         case PARSE_ERR_CREDENTIALS: return "Embedded credentials are not allowed";
         case PARSE_ERR_EMPTY_HOST: return "Host component is empty";
@@ -106,7 +108,7 @@ ParseStatus parse_http_url(const char *raw_url, ParsedUrl *out) {
         return PARSE_ERR_EMPTY_HOST;
     }
     if (host_len >= sizeof(out->host)) {
-        return PARSE_ERR_OVERLONG;
+        return PARSE_ERR_HOST_TOO_LONG;
     }
 
     /* Validate host characters and normalise to lowercase */

@@ -1,3 +1,4 @@
+/* request_parser.h: Typed data structures and contracts for URL parsing. */
 #ifndef REQUEST_PARSER_H
 #define REQUEST_PARSER_H
 
@@ -12,6 +13,7 @@
 typedef enum {
     PARSE_OK = 0,
     PARSE_ERR_OVERLONG,
+    PARSE_ERR_HOST_TOO_LONG,
     PARSE_ERR_INVALID_SCHEME,
     PARSE_ERR_CREDENTIALS,
     PARSE_ERR_EMPTY_HOST,
@@ -31,10 +33,6 @@ typedef struct {
 /**
  * Parses, validates, and normalises an HTTP URL (http://host[:port][/path]).
  * Lowercases the host and ensures memory bounds are strictly respected.
- *
- * @param raw_url The input URL string to parse.
- * @param out     Pointer to ParsedUrl struct to receive parsed fields.
- * @return PARSE_OK on success, or an appropriate ParseStatus error code.
  */
 ParseStatus parse_http_url(const char *raw_url, ParsedUrl *out);
 
