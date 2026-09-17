@@ -1,13 +1,16 @@
 # SecureBrowse — Security-Aware Concurrent Forward Proxy
 
+> **Read [`docs/workflow.md`](docs/workflow.md) before you pick up any issue.** It is required reading for every teammate and every AI agent working on this repository — it explains what an issue actually is and the exact steps from "assigned to me" to a merged pull request. Reading an issue and clicking "Close" on it is never correct; skipping this file is the most common way to get your work reverted or your issue reopened.
+
 SecureBrowse is a Linux/C forward proxy built as a university Operating Systems project and released as a real open-source project from day one. It accepts a web request from a local client, checks whether the request is safe, fetches or tunnels it, and returns the result — the same broad pattern used by commercial secure web gateways, built here with POSIX sockets and `pthread` (POSIX threads).
 
 ## New to this project? Start here
 
-If you are new to this repository (student teammate or outside contributor), read these two things first, in order:
+If you are new to this repository (student teammate or outside contributor), read these in order:
 
-1. [`docs/architecture.md`](docs/architecture.md) — how a request flows through the proxy and how the code is organized.
-2. The Phase 1 issues in the [issue tracker](../../issues) (labelled `P0`) — these build the working concurrent proxy step by step, in dependency order.
+1. [`docs/workflow.md`](docs/workflow.md) — **required**: how to actually take an issue from assignment to a merged, issue-closing pull request.
+2. [`docs/architecture.md`](docs/architecture.md) — how a request flows through the proxy and how the code is organized.
+3. The Phase 1 issues in the [issue tracker](../../issues) (labelled `P0`) — these build the working concurrent proxy step by step, in dependency order.
 
 You do not need prior open-source experience to contribute. [`CONTRIBUTING.md`](CONTRIBUTING.md) walks through setup, branch naming, and how to open your first pull request.
 
