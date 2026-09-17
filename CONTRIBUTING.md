@@ -52,8 +52,12 @@ Compiler warnings are treated as errors (`-Wall -Wextra -Werror -pthread`). Code
 
 1. Create a branch from `main` using the naming convention above.
 2. Make your change, add or update tests, and run `make test` and `make sanitize`.
-3. Fill in the pull request template completely, including the security/privacy impact and secrets checklist.
-4. Link the issue your pull request resolves.
+3. Fill in the pull request template completely. This applies equally to human contributors and AI coding agents — a pull request is not complete without:
+   - A **per-file breakdown**: every file created or changed, what changed, and why. Do not leave the reviewer to re-derive this from the raw diff.
+   - **Test results**: the exact commands you ran (`make test`, `make sanitize`, or manual steps) and their actual outcome, not just a checked box.
+   - The security/privacy impact and secrets checklist.
+   - A closing `Closes #<issue>` line linking the issue the pull request resolves.
+4. `main` is protected: a pull request with at least one approving review and passing CI is required before merge.
 
 ## Review expectations
 
