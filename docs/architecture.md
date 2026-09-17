@@ -59,3 +59,12 @@ SecureBrowse uses a **thread-per-connection** model built on POSIX (Portable Ope
 6. A bounded concurrency limit prevents unlimited thread creation from exhausting system resources.
 
 The heap allocation in step 2 exists specifically to avoid the classic **loop-variable bug**: passing a pointer to a stack variable (or a loop counter) into `pthread_create()` is unsafe because the variable may change or go out of scope before the new thread reads it. Giving each connection its own heap allocation removes that race entirely.
+
+
+## Phase 1 protocol contract: client -> proxy
+
+To keep initial parsing and memory boundaries predictable, Phase 1 defines an explicit framing contract:
+
+- **Request Framing:** Exactly one newline-terminated `http://` URL per TCP connection.
+  ```text
+  [http://example.com/index.html](http://example.com/index.html)\n
