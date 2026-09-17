@@ -1,4 +1,3 @@
-/* request_parser.h: Typed data structures and contracts for URL parsing. */
 #ifndef REQUEST_PARSER_H
 #define REQUEST_PARSER_H
 
