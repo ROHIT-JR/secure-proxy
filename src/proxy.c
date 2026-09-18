@@ -11,6 +11,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "origin_client.h"
 #include "request_parser.h"
 
 #define LISTEN_PORT 8080
@@ -127,10 +128,9 @@ static void send_error_response(int client_fd, int status_code, const char *stat
 }
 
 /* Handles exactly one client connection end to end: read one request line,
- * validate it, and reply. Origin fetching is wired in by Issue #6/#7 --
- * for now a successfully parsed request gets an acknowledgement so this
- * issue's acceptance criteria (valid error or acknowledgement) can be
- * verified with a plain `nc`. */
+ * validate it, fetch it from the origin, and relay the response back. This
+ * is the single-threaded version -- Issue #7/#8 is what turns this into a
+ * concurrent, thread-per-connection server. */
 static void handle_client(int client_fd) {
     struct timeval timeout;
     timeout.tv_sec = CLIENT_READ_TIMEOUT_SECONDS;
@@ -173,15 +173,19 @@ static void handle_client(int client_fd) {
         return;
     }
 
-    /* Sized to comfortably hold the largest possible host (MAX_HOST_LEN)
-     * and path (MAX_PATH_LEN) plus the surrounding boilerplate text, so
-     * snprintf() can never truncate here. */
-    char body[MAX_HOST_LEN + MAX_PATH_LEN + 128];
-    snprintf(body, sizeof(body),
-             "200 OK: Parsed request for host=%s port=%u path=%s\n"
-             "(Origin fetching is implemented in a later issue.)\n",
-             parsed.host, parsed.port, parsed.path);
-    send_error_response(client_fd, 200, "OK", body);
+    FetchStatus fetch_status = fetch_and_relay(&parsed, client_fd);
+
+    /* fetch_and_relay() only fails before any bytes are relayed for
+     * FETCH_ERR_DNS and FETCH_ERR_CONNECT -- those are the only cases
+     * where it's still safe to send our own response. FETCH_ERR_SEND and
+     * FETCH_ERR_RECV mean the client may already have a partial raw
+     * response on the wire; sending another response on top of that
+     * would corrupt the stream, so we just stop. */
+    if (fetch_status == FETCH_ERR_DNS || fetch_status == FETCH_ERR_CONNECT) {
+        char body[256];
+        snprintf(body, sizeof(body), "502 Bad Gateway: %s\n", fetch_status_to_string(fetch_status));
+        send_error_response(client_fd, 502, "Bad Gateway", body);
+    }
 }
 
 int main(void) {
