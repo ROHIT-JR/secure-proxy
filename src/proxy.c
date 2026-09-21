@@ -139,6 +139,33 @@ static void send_error_response(int client_fd, int status_code, const char *stat
     }
 }
 
+/* Shuts down the write side, drains and discards any input the client
+ * already sent but that we never read (e.g. the tail of an oversized
+ * request line), then closes the socket.
+ *
+ * This matters because closing a socket while unread bytes are still
+ * sitting in its kernel receive buffer makes the OS send a TCP RST
+ * instead of an orderly FIN. A RST can arrive before the client has
+ * finished reading the response we just sent, truncating it -- the
+ * client would see "connection reset" instead of our actual error page.
+ * Draining first (bounded by a short timeout, since a well-behaved
+ * client won't have much more queued) avoids that race entirely. */
+static void drain_and_close(int client_fd) {
+    shutdown(client_fd, SHUT_WR);
+
+    struct timeval drain_timeout;
+    drain_timeout.tv_sec = 0;
+    drain_timeout.tv_usec = 200000; /* 200ms is ample for data already in flight */
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &drain_timeout, sizeof(drain_timeout));
+
+    char discard[512];
+    while (recv(client_fd, discard, sizeof(discard), 0) > 0) {
+        /* discard */
+    }
+
+    close(client_fd);
+}
+
 /* Worker thread entry point: extracts client socket, frees heap arguments,
  * detaches thread, handles the request end-to-end, closes the socket, and
  * decrements the active concurrency count. */
@@ -212,7 +239,7 @@ static void *handle_client(void *arg) {
     }
 
 cleanup:
-    close(client_fd);
+    drain_and_close(client_fd);
 
     pthread_mutex_lock(&g_active_clients_mutex);
     g_active_clients--;

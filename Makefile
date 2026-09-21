@@ -52,6 +52,7 @@ $(BIN_DIR):
 test: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TARGET)
 	./$(TARGET)
 	./$(TEST_TARGET)
+	python3 tests/integration/run_integration_tests.py
 
 sanitize: CFLAGS += -fsanitize=address,undefined -g
 sanitize: clean all test
