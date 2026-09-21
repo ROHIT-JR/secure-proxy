@@ -1,8 +1,10 @@
+#define _DEFAULT_SOURCE
 /* proxy.c: Program entry point that starts the listening socket and dispatches accepted connections to worker threads. */
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,16 @@
 #define LISTEN_PORT 8080
 #define REQUEST_LINE_BUF_LEN (MAX_URL_LEN + 3) /* URL + '\r' + '\n' + '\0' */
 #define CLIENT_READ_TIMEOUT_SECONDS 5
+#define MAX_CONCURRENT_CLIENTS 64
+
+/* Heap-allocated per-connection arguments passed to worker threads */
+typedef struct {
+    int client_fd;
+} ClientArgs;
+
+/* Concurrency tracking state */
+static pthread_mutex_t g_active_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_active_clients = 0;
 
 typedef enum {
     LINE_OK,
@@ -108,18 +120,18 @@ static ReadLineStatus read_request_line(int client_fd, char *buf, size_t buf_len
  * in handle_client) plus header boilerplate, so snprintf() can never
  * truncate it. */
 static void send_error_response(int client_fd, int status_code, const char *status_text,
-                                 const char *body) {
+                                const char *body) {
     char response[MAX_HOST_LEN + MAX_PATH_LEN + 256];
     int body_len = (int)strlen(body);
 
     int written = snprintf(response, sizeof(response),
-                            "HTTP/1.1 %d %s\r\n"
-                            "Content-Type: text/plain\r\n"
-                            "Content-Length: %d\r\n"
-                            "Connection: close\r\n"
-                            "\r\n"
-                            "%s",
-                            status_code, status_text, body_len, body);
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: text/plain\r\n"
+                           "Content-Length: %d\r\n"
+                           "Connection: close\r\n"
+                           "\r\n"
+                           "%s",
+                           status_code, status_text, body_len, body);
 
     if (written > 0) {
         size_t to_send = (size_t)written < sizeof(response) ? (size_t)written : sizeof(response);
@@ -127,11 +139,23 @@ static void send_error_response(int client_fd, int status_code, const char *stat
     }
 }
 
-/* Handles exactly one client connection end to end: read one request line,
- * validate it, fetch it from the origin, and relay the response back. This
- * is the single-threaded version -- Issue #7/#8 is what turns this into a
- * concurrent, thread-per-connection server. */
-static void handle_client(int client_fd) {
+/* Worker thread entry point: extracts client socket, frees heap arguments,
+ * detaches thread, handles the request end-to-end, closes the socket, and
+ * decrements the active concurrency count. */
+static void *handle_client(void *arg) {
+    ClientArgs *args = (ClientArgs *)arg;
+    if (args == NULL) {
+        pthread_mutex_lock(&g_active_clients_mutex);
+        g_active_clients--;
+        pthread_mutex_unlock(&g_active_clients_mutex);
+        return NULL;
+    }
+
+    int client_fd = args->client_fd;
+    free(args);
+
+    pthread_detach(pthread_self());
+
     struct timeval timeout;
     timeout.tv_sec = CLIENT_READ_TIMEOUT_SECONDS;
     timeout.tv_usec = 0;
@@ -143,16 +167,16 @@ static void handle_client(int client_fd) {
     switch (status) {
         case LINE_TOO_LARGE:
             send_error_response(client_fd, 413, "Payload Too Large",
-                                 "413 Payload Too Large: Request URL exceeds 2048B.\n");
-            return;
+                                "413 Payload Too Large: Request URL exceeds 2048B.\n");
+            goto cleanup;
         case LINE_TIMEOUT:
             send_error_response(client_fd, 408, "Request Timeout",
-                                 "408 Request Timeout: No complete request line received.\n");
-            return;
+                                "408 Request Timeout: No complete request line received.\n");
+            goto cleanup;
         case LINE_CLOSED:
         case LINE_ERROR:
             /* Client disconnected or the socket errored; nothing to reply to. */
-            return;
+            goto cleanup;
         case LINE_OK:
             break;
     }
@@ -170,7 +194,7 @@ static void handle_client(int client_fd) {
         char body[256];
         snprintf(body, sizeof(body), "400 Bad Request: %s\n", parse_status_to_string(parse_status));
         send_error_response(client_fd, 400, "Bad Request", body);
-        return;
+        goto cleanup;
     }
 
     FetchStatus fetch_status = fetch_and_relay(&parsed, client_fd);
@@ -186,6 +210,15 @@ static void handle_client(int client_fd) {
         snprintf(body, sizeof(body), "502 Bad Gateway: %s\n", fetch_status_to_string(fetch_status));
         send_error_response(client_fd, 502, "Bad Gateway", body);
     }
+
+cleanup:
+    close(client_fd);
+
+    pthread_mutex_lock(&g_active_clients_mutex);
+    g_active_clients--;
+    pthread_mutex_unlock(&g_active_clients_mutex);
+
+    return NULL;
 }
 
 int main(void) {
@@ -208,10 +241,44 @@ int main(void) {
             continue; /* one bad accept must not take the listener down */
         }
 
-        handle_client(client_fd);
-        close(client_fd);
+        /* Check bounded concurrency limit */
+        pthread_mutex_lock(&g_active_clients_mutex);
+        if (g_active_clients >= MAX_CONCURRENT_CLIENTS) {
+            pthread_mutex_unlock(&g_active_clients_mutex);
+            send_error_response(client_fd, 503, "Service Unavailable",
+                                "503 Service Unavailable: Maximum concurrent connections reached.\n");
+            close(client_fd);
+            continue;
+        }
+        g_active_clients++;
+        pthread_mutex_unlock(&g_active_clients_mutex);
+
+        /* Allocate heap-owned ClientArgs to avoid loop-variable races */
+        ClientArgs *args = (ClientArgs *)malloc(sizeof(ClientArgs));
+        if (args == NULL) {
+            perror("malloc");
+            close(client_fd);
+            pthread_mutex_lock(&g_active_clients_mutex);
+            g_active_clients--;
+            pthread_mutex_unlock(&g_active_clients_mutex);
+            continue;
+        }
+        args->client_fd = client_fd;
+
+        pthread_t tid;
+        int err = pthread_create(&tid, NULL, handle_client, args);
+        if (err != 0) {
+            fprintf(stderr, "pthread_create failed: %s\n", strerror(err));
+            /* On thread creation failure: close socket, free args, decrement count */
+            close(client_fd);
+            free(args);
+            pthread_mutex_lock(&g_active_clients_mutex);
+            g_active_clients--;
+            pthread_mutex_unlock(&g_active_clients_mutex);
+            continue;
+        }
     }
 
-    close(listen_fd); /* unreachable in this single-threaded skeleton, kept for clarity */
+    close(listen_fd);
     return 0;
 }
