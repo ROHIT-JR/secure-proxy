@@ -11,8 +11,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "logger.h"
 #include "origin_client.h"
 #include "request_parser.h"
 
@@ -20,6 +22,7 @@
 #define REQUEST_LINE_BUF_LEN (MAX_URL_LEN + 3) /* URL + '\r' + '\n' + '\0' */
 #define CLIENT_READ_TIMEOUT_SECONDS 5
 #define MAX_CONCURRENT_CLIENTS 64
+#define DEFAULT_LOG_PATH "proxy.log"
 
 /* Heap-allocated per-connection arguments passed to worker threads */
 typedef struct {
@@ -183,6 +186,17 @@ static void *handle_client(void *arg) {
 
     pthread_detach(pthread_self());
 
+    /* Everything that goes into the request log is collected here and written
+     * once, at cleanup. Only the validated, normalised host is ever recorded --
+     * never the path, query string, credentials, fragment, or the raw line. */
+    unsigned long request_id = logger_next_request_id();
+    struct timespec start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    const char *log_host = "-";
+    const char *log_decision = "client_closed";
+    int log_status = 0;
+    unsigned long long log_bytes = 0;
+
     struct timeval timeout;
     timeout.tv_sec = CLIENT_READ_TIMEOUT_SECONDS;
     timeout.tv_usec = 0;
@@ -195,10 +209,14 @@ static void *handle_client(void *arg) {
         case LINE_TOO_LARGE:
             send_error_response(client_fd, 413, "Payload Too Large",
                                 "413 Payload Too Large: Request URL exceeds 2048B.\n");
+            log_decision = "too_large";
+            log_status = 413;
             goto cleanup;
         case LINE_TIMEOUT:
             send_error_response(client_fd, 408, "Request Timeout",
                                 "408 Request Timeout: No complete request line received.\n");
+            log_decision = "timeout";
+            log_status = 408;
             goto cleanup;
         case LINE_CLOSED:
         case LINE_ERROR:
@@ -221,10 +239,16 @@ static void *handle_client(void *arg) {
         char body[256];
         snprintf(body, sizeof(body), "400 Bad Request: %s\n", parse_status_to_string(parse_status));
         send_error_response(client_fd, 400, "Bad Request", body);
+        log_decision = "bad_request";
+        log_status = 400;
         goto cleanup;
     }
 
-    FetchStatus fetch_status = fetch_and_relay(&parsed, client_fd);
+    log_host = parsed.host; /* validated + lowercased by the parser */
+
+    FetchStats stats;
+    FetchStatus fetch_status = fetch_and_relay(&parsed, client_fd, &stats);
+    log_bytes = stats.bytes_relayed;
 
     /* fetch_and_relay() only fails before any bytes are relayed for
      * FETCH_ERR_DNS and FETCH_ERR_CONNECT -- those are the only cases
@@ -236,9 +260,24 @@ static void *handle_client(void *arg) {
         char body[256];
         snprintf(body, sizeof(body), "502 Bad Gateway: %s\n", fetch_status_to_string(fetch_status));
         send_error_response(client_fd, 502, "Bad Gateway", body);
+        log_decision = "bad_gateway";
+        log_status = 502;
+    } else if (fetch_status == FETCH_OK) {
+        log_decision = "allowed";
+        log_status = stats.origin_status;
+    } else {
+        log_decision = "relay_error";
+        log_status = stats.origin_status;
     }
 
-cleanup:
+cleanup:;
+    struct timespec end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &end_ts);
+    long duration_ms = (long)(end_ts.tv_sec - start_ts.tv_sec) * 1000L +
+                       (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000L;
+    /* Logged before drain_and_close() so the duration excludes the drain delay. */
+    log_request(request_id, log_host, log_decision, log_status, log_bytes, duration_ms);
+
     drain_and_close(client_fd);
 
     pthread_mutex_lock(&g_active_clients_mutex);
@@ -253,6 +292,16 @@ int main(void) {
      * process with SIGPIPE; failed writes are handled via send()'s
      * return value instead. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* A log file that can't be opened must never stop the proxy from serving. */
+    const char *log_path = getenv("PROXY_LOG_FILE");
+    if (log_path == NULL || log_path[0] == '\0') {
+        log_path = DEFAULT_LOG_PATH;
+    }
+    if (logger_init(log_path) != 0) {
+        fprintf(stderr, "proxy: warning: cannot open log file '%s'; request logging disabled\n",
+                log_path);
+    }
 
     int listen_fd = create_listening_socket();
     printf("proxy: listening on port %d\n", LISTEN_PORT);
@@ -274,6 +323,7 @@ int main(void) {
             pthread_mutex_unlock(&g_active_clients_mutex);
             send_error_response(client_fd, 503, "Service Unavailable",
                                 "503 Service Unavailable: Maximum concurrent connections reached.\n");
+            log_request(logger_next_request_id(), "-", "overloaded", 503, 0, 0);
             close(client_fd);
             continue;
         }
@@ -284,6 +334,7 @@ int main(void) {
         ClientArgs *args = (ClientArgs *)malloc(sizeof(ClientArgs));
         if (args == NULL) {
             perror("malloc");
+            log_request(logger_next_request_id(), "-", "internal_error", 0, 0, 0);
             close(client_fd);
             pthread_mutex_lock(&g_active_clients_mutex);
             g_active_clients--;
@@ -296,6 +347,7 @@ int main(void) {
         int err = pthread_create(&tid, NULL, handle_client, args);
         if (err != 0) {
             fprintf(stderr, "pthread_create failed: %s\n", strerror(err));
+            log_request(logger_next_request_id(), "-", "internal_error", 0, 0, 0);
             /* On thread creation failure: close socket, free args, decrement count */
             close(client_fd);
             free(args);

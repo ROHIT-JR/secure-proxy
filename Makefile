@@ -7,6 +7,7 @@ PROXY_TARGET = $(BIN_DIR)/proxy
 CLIENT_TARGET = $(BIN_DIR)/client
 TEST_TARGET = $(BIN_DIR)/test_parser
 FETCH_TEST_TARGET = $(BIN_DIR)/fetch_test
+LOGGER_TEST_TARGET = $(BIN_DIR)/test_logger
 
 SRC = src/hello_proxy.c
 PARSER_SRC = src/request_parser.c
@@ -14,8 +15,10 @@ PROXY_SRC = src/proxy.c
 CLIENT_SRC = src/client.c
 UTIL_SRC = src/util.c
 ORIGIN_SRC = src/origin_client.c
+LOGGER_SRC = src/logger.c
 TEST_SRC = tests/test_parser.c
 FETCH_TEST_SRC = tests/fetch_test.c
+LOGGER_TEST_SRC = tests/test_logger.c
 
 OBJ = $(SRC:.c=.o)
 PARSER_OBJ = $(PARSER_SRC:.c=.o)
@@ -23,15 +26,17 @@ PROXY_OBJ = $(PROXY_SRC:.c=.o)
 CLIENT_OBJ = $(CLIENT_SRC:.c=.o)
 UTIL_OBJ = $(UTIL_SRC:.c=.o)
 ORIGIN_OBJ = $(ORIGIN_SRC:.c=.o)
+LOGGER_OBJ = $(LOGGER_SRC:.c=.o)
 TEST_OBJ = $(TEST_SRC:.c=.o)
 FETCH_TEST_OBJ = $(FETCH_TEST_SRC:.c=.o)
+LOGGER_TEST_OBJ = $(LOGGER_TEST_SRC:.c=.o)
 
-all: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TARGET)
+all: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TARGET) $(LOGGER_TEST_TARGET)
 
 $(TARGET): $(OBJ) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(PROXY_TARGET): $(PROXY_OBJ) $(PARSER_OBJ) $(ORIGIN_OBJ) $(UTIL_OBJ) | $(BIN_DIR)
+$(PROXY_TARGET): $(PROXY_OBJ) $(PARSER_OBJ) $(ORIGIN_OBJ) $(UTIL_OBJ) $(LOGGER_OBJ) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(CLIENT_TARGET): $(CLIENT_OBJ) $(UTIL_OBJ) | $(BIN_DIR)
@@ -43,15 +48,19 @@ $(TEST_TARGET): $(TEST_OBJ) $(PARSER_OBJ) | $(BIN_DIR)
 $(FETCH_TEST_TARGET): $(FETCH_TEST_OBJ) $(ORIGIN_OBJ) $(UTIL_OBJ) $(PARSER_OBJ) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(LOGGER_TEST_TARGET): $(LOGGER_TEST_OBJ) $(LOGGER_OBJ) $(UTIL_OBJ) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TARGET)
+test: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TARGET) $(LOGGER_TEST_TARGET)
 	./$(TARGET)
 	./$(TEST_TARGET)
+	./$(LOGGER_TEST_TARGET)
 	python3 tests/integration/run_integration_tests.py
 
 sanitize: CFLAGS += -fsanitize=address,undefined -g

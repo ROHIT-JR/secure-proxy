@@ -11,6 +11,12 @@ typedef enum {
     FETCH_ERR_RECV
 } FetchStatus;
 
+/* Optional facts about a fetch, filled in by fetch_and_relay() for logging. */
+typedef struct {
+    unsigned long long bytes_relayed; /* origin bytes successfully written to out_fd */
+    int origin_status;                /* HTTP status code from the origin's status line, 0 if unknown */
+} FetchStats;
+
 /*
  * Resolves url->host, opens an outbound TCP connection to the origin (with
  * a connect timeout), sends an HTTP/1.0 GET request for url->path, and
@@ -25,8 +31,11 @@ typedef enum {
  * origin bytes were relayed (FETCH_ERR_DNS or FETCH_ERR_CONNECT). Once
  * relaying has started, out_fd has already received a partial raw
  * response and must not receive a second, different one on top of it.
+ *
+ * `stats` may be NULL. When provided it is always initialised, so callers
+ * can read it on every return path.
  */
-FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd);
+FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats);
 
 /* Returns a human-readable description of a FetchStatus code. */
 const char *fetch_status_to_string(FetchStatus status);
