@@ -49,5 +49,19 @@ void logger_sanitize_host(const char *in, char *out, size_t out_len);
 void log_request(unsigned long request_id, const char *host, const char *decision, int status,
                  unsigned long long bytes_forwarded, long duration_ms);
 
+/*
+ * Same as log_request(), plus optional extra "key=value" fields appended after
+ * duration_ms (for example "cache=hit"). `extras` is reduced to the characters
+ * [a-z0-9_=,.-] and spaces, so it can never inject a newline or leak a URL.
+ * NULL or empty means no extras.
+ *
+ * CONTRACT: `extras` must be built only from fixed, code-supplied tokens
+ * (e.g. "cache=hit"), never from anything a client sent. The logger removes
+ * URL punctuation and newlines as a safety net, but it cannot tell whether a
+ * plain word is sensitive.
+ */
+void log_request_ex(unsigned long request_id, const char *host, const char *decision, int status,
+                    unsigned long long bytes_forwarded, long duration_ms, const char *extras);
+
 /* Number of log lines that could not be written (disk full, closed fd, ...). */
 unsigned long logger_failure_count(void);

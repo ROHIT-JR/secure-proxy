@@ -14,10 +14,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "cache.h"
 #include "logger.h"
 #include "origin_client.h"
 #include "policy.h"
 #include "request_parser.h"
+#include "util.h"
 
 #define LISTEN_PORT 8080
 #define REQUEST_LINE_BUF_LEN (MAX_URL_LEN + 3) /* URL + '\r' + '\n' + '\0' */
@@ -202,6 +204,9 @@ static void *handle_client(void *arg) {
     const char *log_decision = "client_closed";
     int log_status = 0;
     unsigned long long log_bytes = 0;
+    const char *log_extras = NULL;
+    FetchStats stats;
+    memset(&stats, 0, sizeof(stats));
 
     struct timeval timeout;
     timeout.tv_sec = CLIENT_READ_TIMEOUT_SECONDS;
@@ -262,9 +267,44 @@ static void *handle_client(void *arg) {
         goto cleanup;
     }
 
-    FetchStats stats;
+    /* Only plain URLs are cached: a query string often carries a token or a per-user value. */
+    char cache_key[CACHE_KEY_MAX];
+    int cache_usable = 0;
+    if (cache_is_enabled()) {
+        if (strchr(parsed.path, '?') != NULL || cache_make_key(cache_key, sizeof(cache_key), parsed.host,
+                                                               parsed.port, parsed.path) != 0) {
+            log_extras = "cache=bypass";
+        } else {
+            cache_usable = 1;
+            size_t hit_len = 0;
+            unsigned char *hit = cache_lookup(cache_key, &hit_len);
+            if (hit != NULL) {
+                /* Served from memory: the destination was already validated when it was fetched. */
+                send_all(client_fd, hit, hit_len);
+                free(hit);
+                log_decision = "allowed";
+                log_status = 200;
+                log_bytes = hit_len;
+                log_extras = "cache=hit";
+                goto cleanup;
+            }
+            log_extras = "cache=miss";
+            stats.capture_limit = CACHE_DEFAULT_MAX_ENTRY_BYTES;
+        }
+    }
+
     FetchStatus fetch_status = fetch_and_relay(&parsed, client_fd, &stats);
     log_bytes = stats.bytes_relayed;
+
+    if (cache_usable && fetch_status == FETCH_OK && stats.capture != NULL) {
+        CacheVerdict verdict = cache_evaluate_response(stats.capture, stats.capture_len);
+        if (verdict.cacheable &&
+            cache_store(cache_key, stats.capture, stats.capture_len, verdict.ttl_seconds) == 0) {
+            log_extras = "cache=stored";
+        }
+    }
+    free(stats.capture); /* the single owner of the captured copy (cache_store made its own) */
+    stats.capture = NULL;
 
     /* fetch_and_relay() only fails before any bytes are relayed for
      * FETCH_ERR_DNS and FETCH_ERR_CONNECT -- those are the only cases
@@ -298,7 +338,8 @@ cleanup:;
     long duration_ms = (long)(end_ts.tv_sec - start_ts.tv_sec) * 1000L +
                        (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000L;
     /* Logged before drain_and_close() so the duration excludes the drain delay. */
-    log_request(request_id, log_host, log_decision, log_status, log_bytes, duration_ms);
+    free(stats.capture); /* NULL on every path except an early exit after a capture started */
+    log_request_ex(request_id, log_host, log_decision, log_status, log_bytes, duration_ms, log_extras);
 
     drain_and_close(client_fd);
 
@@ -363,6 +404,14 @@ int main(void) {
                         "DISABLED. Use only for local testing.\n");
     }
 
+    const char *cache_env = getenv("PROXY_CACHE");
+    if (cache_env != NULL && strcmp(cache_env, "0") == 0) {
+        printf("proxy: response cache disabled (PROXY_CACHE=0)\n");
+    } else if (cache_init(CACHE_DEFAULT_MAX_ENTRIES, CACHE_DEFAULT_MAX_TOTAL_BYTES,
+                          CACHE_DEFAULT_MAX_ENTRY_BYTES) != 0) {
+        fprintf(stderr, "proxy: warning: could not allocate the response cache; caching disabled\n");
+    }
+
     int listen_fd = create_listening_socket();
     printf("proxy: listening on port %d\n", LISTEN_PORT);
     fflush(stdout); /* stdout is fully buffered when not a tty (e.g. redirected to a log file) */
@@ -419,6 +468,7 @@ int main(void) {
     }
 
     close(listen_fd);
+    cache_destroy();
     policy_free(&g_policy);
     return 0;
 }

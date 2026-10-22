@@ -29,7 +29,7 @@ This document describes what SecureBrowse protects, who it protects against, how
 - Allowlist/blocklist policy checks happen **before** DNS resolution or any outbound connection (Issue 10; see `docs/policy.md`). Allowlists fail closed, and a policy file the operator explicitly configured but that cannot be read stops the proxy from starting.
 - Every destination address is checked against the allowed-network policy below, both when a name is resolved and again immediately before (and just after) connecting. Names are resolved exactly once and the checked address is the one used, which defeats DNS rebinding by construction (Issue 11; see "Allowed-network policy").
 - Logs record only the validated hostname — never credentials, query strings, fragments, paths, or the raw request line — are written with owner-only permissions, and cannot be interleaved or forged by hostile input (Issue 9; see `docs/logging.md`).
-- The cache never stores responses containing `Set-Cookie`, `Authorization`, or unapproved cache-control directives (Issue 12).
+- The cache never stores responses containing `Set-Cookie`, `Authorization`, unapproved cache-control directives, partial bodies, non-200 statuses, or responses to URLs with a query string; it is bounded (entries, bytes, per-entry size, lifetime) and consulted only after the policy and network-safety checks (Issue 12; see `docs/cache.md`).
 - The reputation provider only ever receives the normalised hostname, never full URLs, credentials, or request bodies (Issue 14).
 - Every request has a maximum size and a connection timeout, so a slow or oversized client cannot tie up a worker thread indefinitely.
 

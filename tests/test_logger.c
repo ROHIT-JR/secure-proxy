@@ -224,6 +224,36 @@ static void test_failures_are_not_fatal(void) {
     CHECK(1, "repeated logger_close() did not crash");
 }
 
+static void test_extras_field(void) {
+    char path[64];
+    make_temp_path(path, sizeof(path));
+    logger_init(path);
+    log_request_ex(5, "example.com", "allowed", 200, 9, 1, "cache=hit");
+    log_request_ex(6, "example.com", "allowed", 200, 9, 1, NULL);
+    log_request_ex(7, "example.com", "allowed", 200, 9, 1, "");
+    /* hostile extras: injection and URL material must be neutralised */
+    log_request_ex(8, "example.com", "allowed", 200, 9, 1, "cache=hit\nFORGED line http://u:p@x/?token=secret");
+    logger_close();
+
+    FILE *f = fopen(path, "r");
+    char l1[512] = "", l2[512] = "", l3[512] = "", l4[512] = "", l5[512] = "";
+    if (f != NULL) {
+        if (!fgets(l1, sizeof(l1), f)) l1[0] = 0;
+        if (!fgets(l2, sizeof(l2), f)) l2[0] = 0;
+        if (!fgets(l3, sizeof(l3), f)) l3[0] = 0;
+        if (!fgets(l4, sizeof(l4), f)) l4[0] = 0;
+        if (!fgets(l5, sizeof(l5), f)) l5[0] = 0;
+        fclose(f);
+    }
+    unlink(path);
+    CHECK(strstr(l1, "duration_ms=1 cache=hit\n") != NULL, "extras appended: %s", l1);
+    CHECK(strstr(l2, "duration_ms=1\n") != NULL && strstr(l2, "cache") == NULL, "NULL extras add nothing: %s", l2);
+    CHECK(strstr(l3, "duration_ms=1\n") != NULL, "empty extras add nothing: %s", l3);
+    CHECK(l5[0] == '\0', "an injected newline must not create a 5th line");
+    CHECK(strstr(l4, "://") == NULL && strchr(l4, '?') == NULL && strchr(l4, '@') == NULL,
+          "no URL structure survives in extras (the logger cannot judge letters, so callers must only pass fixed tokens): %s", l4);
+}
+
 static void test_request_ids_unique_and_increasing(void) {
     unsigned long a = logger_next_request_id();
     unsigned long b = logger_next_request_id();
@@ -239,6 +269,7 @@ int main(void) {
     test_concurrent_lines_not_interleaved();
     test_failures_are_not_fatal();
     test_request_ids_unique_and_increasing();
+    test_extras_field();
     printf("Result: %d / %d tests passed successfully.\n", passed_tests, total_tests);
     return passed_tests == total_tests ? 0 : 1;
 }
