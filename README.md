@@ -70,8 +70,12 @@ make
 ### Test
 
 ```sh
-make test
+make test               # unit tests + end-to-end integration tests
+make load-test          # seeded concurrent load test
+make load-test-sanitize # the same load under AddressSanitizer + leak check at shutdown
 ```
+
+See [`docs/testing.md`](docs/testing.md) for what each layer proves and its known limits.
 
 ### Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer)
 

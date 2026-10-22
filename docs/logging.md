@@ -44,10 +44,11 @@ Each request produces exactly one line of space-separated `key=value` fields (ea
 | `decision` | Meaning |
 | --- | --- |
 | `allowed` | The page was fetched and forwarded. |
-| `bad_request` | The request line was not a valid `http://` URL (400). |
+| `bad_request` | The request line was not a valid `http://` URL, or contained a NUL byte (400). |
 | `too_large` | The request line exceeded 2048 bytes (413). |
 | `timeout` | The client did not finish sending its request line in time (408). |
-| `bad_gateway` | DNS (Domain Name System) lookup or connection to the origin failed (502). |
+| `bad_gateway` | DNS (Domain Name System) lookup or connection to the origin failed, or the origin hung up without sending anything (502). |
+| `gateway_timeout` | The origin accepted the connection but did not respond in time (504). |
 | `relay_error` | The origin or client connection broke after forwarding had started. |
 | `overloaded` | The 64-client concurrency limit was reached (503). |
 | `client_closed` | The client connected and disconnected without sending a request (for example a port scan or health check). |

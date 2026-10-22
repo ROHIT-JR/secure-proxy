@@ -13,7 +13,10 @@ ever contacted, per the project's safe-testing rules.
 
 import http.server
 import os
+import random
 import re
+import shlex
+import signal
 import socket
 import ssl
 import subprocess
@@ -140,8 +143,10 @@ def start_proxy(log_path, extra_env=None, tmp_dir=None, private_ok=True):
         # TEST-ONLY override so the fixtures can live on 127.0.0.1. SSRF tests turn it off.
         env["PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS"] = "1"
     env.update(extra_env or {})
+    # PROXY_WRAPPER lets CI run the proxy under a tool, e.g. PROXY_WRAPPER="valgrind --error-exitcode=99".
+    wrapper = shlex.split(os.environ.get("PROXY_WRAPPER", ""))
     proc = subprocess.Popen(
-        [str(PROXY_BIN)],
+        wrapper + [str(PROXY_BIN)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -1110,6 +1115,276 @@ def test_decision_pages(tmp_dir):
         stop_proxy(proc)
 
 
+class MisbehavingOrigin:
+    """A raw TCP origin that fails in the nastiest realistic ways, chosen by the request path."""
+
+    HEAD = b"HTTP/1.0 200 OK\r\nContent-Length: 100000\r\n\r\n"
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(32)
+        self.port = self.sock.getsockname()[1]
+        self.hits = {}
+        self._stop = False
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        self.sock.settimeout(0.2)
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            conn.settimeout(5)
+            buf = b""
+            while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            path = buf.split(b" ", 2)[1].decode(errors="replace").split("?", 1)[0]
+            self.hits[path] = self.hits.get(path, 0) + 1
+            if path == "/stall":            # accepts the request, then says nothing
+                time.sleep(4)
+            elif path == "/empty":          # hangs up without a single byte
+                pass
+            elif path == "/partial-close":  # promises 100000 bytes, sends 5000, closes cleanly
+                conn.sendall(self.HEAD + b"P" * 5000)
+            elif path == "/partial-reset":  # same, then a TCP reset
+                conn.sendall(self.HEAD + b"P" * 5000)
+                time.sleep(0.1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+            elif path == "/partial-stall":  # sends some, then goes silent
+                conn.sendall(self.HEAD + b"P" * 1000)
+                time.sleep(4)
+            elif path == "/garbage":        # not HTTP at all
+                conn.sendall(b"\x00\x01\x02 this is not http \xff\xfe\r\n")
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self._stop = True
+        self.sock.close()
+
+
+def test_origin_failures(tmp_dir):
+    bad = MisbehavingOrigin()
+    log_path = Path(tmp_dir) / "failures.log"
+    proc = start_proxy(log_path, {"PROXY_ORIGIN_READ_TIMEOUT_SECONDS": "1"}, tmp_dir)
+    try:
+        baseline_fds = proxy_fd_count(proc.pid)
+
+        def healthy():
+            return b"fixture: index page" in send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+
+        def ask(path):
+            t0 = time.time()
+            raw = send_request(f"http://127.0.0.1:{bad.port}{path}\n", timeout=8)
+            return raw, time.time() - t0
+
+        raw, took = ask("/stall")
+        report("origin accepts then goes silent -> 504 Gateway Timeout at the read timeout",
+               raw.startswith(b"HTTP/1.1 504") and 0.8 < took < 3.0, f"{raw[:30]!r} after {took:.1f}s")
+        report("proxy still healthy after an origin timeout", healthy())
+
+        raw, took = ask("/empty")
+        report("origin closes without sending anything -> 502 (not an empty 'success')",
+               raw.startswith(b"HTTP/1.1 502") and took < 2.0, f"{raw[:30]!r} after {took:.1f}s")
+        report("proxy still healthy after an empty origin reply", healthy())
+
+        sent = MisbehavingOrigin.HEAD + b"P" * 5000
+        raw, _ = ask("/partial-close")
+        report("truncated origin reply (clean close): client gets exactly what the origin sent, no error page glued on",
+               raw == sent, f"got {len(raw)} bytes, expected {len(sent)}; tail={raw[-60:]!r}")
+        raw, _ = ask("/partial-reset")
+        report("truncated origin reply (TCP reset): no error page is appended to the partial response",
+               raw.startswith(sent[:200]) and b"HTTP/1.1 50" not in raw[len(MisbehavingOrigin.HEAD):], f"{len(raw)} bytes")
+        raw, took = ask("/partial-stall")
+        sent_stall = MisbehavingOrigin.HEAD + b"P" * 1000
+        report("origin stalls mid-body: the partial response is kept as is and the connection ends at the timeout",
+               raw == sent_stall and 0.8 < took < 3.0, f"{len(raw)} bytes after {took:.1f}s")
+        raw, _ = ask("/garbage")
+        report("a non-HTTP origin reply is relayed byte-for-byte (the proxy is not an HTTP parser) and does not crash it",
+               raw == b"\x00\x01\x02 this is not http \xff\xfe\r\n", raw)
+        before = bad.hits.get("/partial-close", 0)
+        ask("/partial-close")
+        ask("/partial-close")
+        report("truncated responses are never cached", bad.hits.get("/partial-close") == before + 2)
+        report("proxy still healthy after every kind of origin failure", healthy())
+
+        time.sleep(0.5)
+        report("no leaked file descriptors after origin failures",
+               proxy_fd_count(proc.pid) <= baseline_fds, f"baseline={baseline_fds} now={proxy_fd_count(proc.pid)}")
+        log = log_path.read_text()
+        report("failures are logged: decision=gateway_timeout status=504 and decision=bad_gateway status=502",
+               "decision=gateway_timeout status=504" in log and "decision=bad_gateway status=502" in log)
+        report("partial relays are logged as relay_error", "decision=relay_error" in log)
+        lines = [l for l in log.splitlines() if l]
+        report("every log line stays well formed", all(LOG_LINE_RE.match(l) for l in lines),
+               [l for l in lines if not LOG_LINE_RE.match(l)][:2])
+    finally:
+        stop_proxy(proc)
+        bad.close()
+
+
+def test_bad_input_battery(tmp_dir):
+    """Hundreds of hostile or broken requests, concurrently. The proxy must keep serving
+    normal requests, never crash, and not leak file descriptors."""
+    echo = EchoServer()
+    block = write_rules(tmp_dir, "bat_block.txt", "blocked-battery.invalid\n")
+    log_path = Path(tmp_dir) / "battery.log"
+    # SSRF protection ON for the private-address cases; CONNECT port pinned to the echo port
+    proc = start_proxy(log_path, {"PROXY_BLOCKLIST": str(block), "PROXY_CONNECT_PORT": str(echo.port)},
+                       tmp_dir, private_ok=False)
+    try:
+        baseline_fds = proxy_fd_count(proc.pid)
+        rng = random.Random(20260101)  # fixed seed: the battery is repeatable
+
+        requests = []
+        for i in range(120):  # random bytes, with and without a line terminator
+            if i % 3 == 0:
+                blob = bytes(rng.randrange(256) for _ in range(rng.randrange(1, 3000)))  # may contain NUL / '\n'
+            else:
+                # NUL- and newline-free, so these reach the 'line too long' and 5 s read-timeout (408) paths
+                # instead of being rejected on the first NUL byte
+                blob = bytes(rng.choice([b for b in range(1, 256) if b != 10]) for _ in range(rng.randrange(1, 3000)))
+            requests.append(("random bytes", blob if rng.random() < 0.5 else blob + b"\n"))
+        urls = ["http://", "http:///", "http://:80/", "http://a:99999/", "http://[::1]/", "http://u:p@h/", "ftp://x/",
+                "http://exa mple.com/", "http://example.com/\x00x", "http://example.com/#frag", "HTTP://", "http:/x",
+                "//example.com", "http://" + "a" * 300 + "/", "http://example.com:/", "http://a..b/", "\n", "\r\n", " \n",
+                "http://example.com/" + "z" * 2100, "GET / HTTP/1.1", "CONNECT", "CONNECT :", "CONNECT a:b:c",
+                "http://blocked-battery.invalid/", "http://10.1.2.3/", "http://127.0.0.1/", "http://localhost/",
+                "http://2130706433/", "http://169.254.169.254/latest/meta-data/", "http://does-not-exist.invalid/"]
+        for u in urls:
+            for _ in range(4):
+                requests.append(("known-bad", (u + "\n").encode(errors="replace")))
+        for _ in range(20):
+            requests.append(("tunnel to private", f"CONNECT 127.0.0.1:{echo.port} HTTP/1.1\r\n\r\n".encode()))
+        for _ in range(15):
+            requests.append(("empty connection", b""))
+        for _ in range(15):
+            requests.append(("half a line then hang up", b"http://example.com/par"))
+        rng.shuffle(requests)
+
+        outcomes = {"exceptions": 0, "answered": 0, "silent": 0}
+        lock = threading.Lock()
+
+        def fire(item):
+            _, data = item
+            try:
+                s2 = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=8)
+                if data:
+                    s2.sendall(data)
+                if data == b"" or data.endswith(b"par"):
+                    s2.close()  # connect-and-leave / half-a-line-and-leave
+                    with lock:
+                        outcomes["silent"] += 1
+                    return
+                got, _eof = read_all_until_eof(s2, 8)
+                s2.close()
+                with lock:
+                    outcomes["answered" if got else "silent"] += 1
+            except (OSError, socket.timeout):
+                with lock:
+                    outcomes["exceptions"] += 1
+
+        sem = threading.Semaphore(24)  # below the proxy's own 64-client limit
+
+        def runner(item):
+            with sem:
+                fire(item)
+
+        threads = [threading.Thread(target=runner, args=(r,)) for r in requests]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        took = time.time() - t0
+
+        report(f"{len(requests)} hostile/broken requests were all handled (no connection errors), in {took:.0f}s",
+               outcomes["exceptions"] == 0, outcomes)
+        # A NUL byte used to cut the line short, so the validator never saw what followed it and
+        # "http://example.com/\0x" was quietly processed as "http://example.com/" (and slowly, via DNS).
+        nul_cases = [b"http://example.com/\x00x\n", b"http://allowed.example\x00.evil.example/\n", b"\x00\n",
+                     b"http://example.com/\x00", b"CONNECT a.example:443\x00 HTTP/1.1\r\n\r\n"]
+        slow, wrong = [], []
+        for case in nul_cases:
+            t0 = time.time()
+            resp = send_request(case if case.endswith(b"\n") else case + b"\n")
+            if not resp.startswith(b"HTTP/1.1 400"):
+                wrong.append((case, resp[:30]))
+            if time.time() - t0 > 2:
+                slow.append(case)
+        report("a NUL byte anywhere in the request line is rejected with 400 immediately (never truncated and processed)",
+               not wrong and not slow, f"wrong={wrong} slow={slow}")
+
+        ok = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+        report("the proxy is still alive and BLOCKS private addresses after the battery (SSRF protection still on)",
+               proc.poll() is None and status_line_of(ok).startswith("HTTP/1.1 403"), status_line_of(ok))
+        s2, first = open_tunnel(f"does-not-exist.invalid:{echo.port}")
+        report("and it still answers other requests correctly", first.startswith(b"HTTP/1.1 502"), first[:40])
+        s2.close()
+        time.sleep(1.0)
+        report("no leaked file descriptors after the battery",
+               proxy_fd_count(proc.pid) <= baseline_fds, f"baseline={baseline_fds} now={proxy_fd_count(proc.pid)}")
+        log = log_path.read_text()
+        lines = [l for l in log.splitlines() if l]
+        report("every request the battery caused produced a well-formed log line",
+               len(lines) > 150 and all(LOG_LINE_RE.match(l) for l in lines),
+               [l for l in lines if not LOG_LINE_RE.match(l)][:2])
+        decisions = {m.group(1) for l in lines if (m := re.search(r"decision=([a-z_]+)", l))}
+        needed = {"timeout", "too_large", "bad_request", "blocked_private", "blocked_policy", "bad_gateway", "client_closed"}
+        report("the battery really exercised the timeout, oversize, malformed, private, policy, DNS and early-hangup paths",
+               needed <= decisions, f"missing: {sorted(needed - decisions)}")
+        report("nothing sensitive in the log after random input (no raw request text)",
+               "hunter" not in log and "meta-data" not in log and "frag" not in log and "\x00" not in log)
+    finally:
+        stop_proxy(proc)
+        echo.close()
+
+
+def test_graceful_shutdown(tmp_dir):
+    for label, signum in (("SIGTERM", signal.SIGTERM), ("SIGINT", signal.SIGINT)):
+        env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "shutdown.log"),
+                   PROXY_ALLOWLIST=str(write_rules(tmp_dir, "sd_a.txt", "# off\n")),
+                   PROXY_BLOCKLIST=str(write_rules(tmp_dir, "sd_b.txt", "# none\n")))
+        wrapper = shlex.split(os.environ.get("PROXY_WRAPPER", ""))
+        proc = subprocess.Popen(wrapper + [str(PROXY_BIN)], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(50):
+                try:
+                    socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=0.2).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            send_request("not-a-url\n")
+            t0 = time.time()
+            proc.send_signal(signum)
+            try:
+                rc = proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = None
+            out = proc.stdout.read().decode(errors="replace")
+            report(f"{label} shuts the proxy down cleanly (exit code 0, promptly)",
+                   rc == 0 and time.time() - t0 < 5 and "shut down" in out, f"rc={rc} out={out[-60:]!r}")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+
+
 def test_policy_startup_errors(tmp_dir):
     env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
                PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
@@ -1145,6 +1420,9 @@ def main():
         test_policy_startup_errors(tmp_dir)
         test_reputation(tmp_dir)
         test_decision_pages(tmp_dir)
+        test_origin_failures(tmp_dir)
+        test_bad_input_battery(tmp_dir)
+        test_graceful_shutdown(tmp_dir)
         test_response_cache(tmp_dir)
         test_connect_tunnel(tmp_dir)
         test_connect_real_tls(tmp_dir)
