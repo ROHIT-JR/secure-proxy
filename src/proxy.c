@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -26,6 +27,12 @@
 #define CLIENT_READ_TIMEOUT_SECONDS 5
 #define MAX_CONCURRENT_CLIENTS 64
 #define DEFAULT_LOG_PATH "proxy.log"
+#define CONNECT_DEFAULT_PORT 443          /* the only port CONNECT may reach unless overridden */
+#define CONNECT_HEADER_MAX 8192           /* bound on the headers that follow a CONNECT line */
+#define TUNNEL_DEFAULT_IDLE_SECONDS 120   /* an idle tunnel is closed after this long */
+#define TUNNEL_HALF_CLOSE_SECONDS 5       /* grace once one side has finished and closed */
+#define TUNNEL_BUF_LEN 16384
+#define TUNNEL_SEND_TIMEOUT_SECONDS 30
 #define DEFAULT_ALLOWLIST_PATH "config/allowlist.txt"
 #define DEFAULT_BLOCKLIST_PATH "config/blocklist.txt"
 
@@ -36,6 +43,9 @@ typedef struct {
 
 /* Allowlist/blocklist rules: loaded once at startup, then only read by worker threads. */
 static Policy g_policy;
+
+static unsigned g_connect_port = CONNECT_DEFAULT_PORT;
+static int g_tunnel_idle_seconds = TUNNEL_DEFAULT_IDLE_SECONDS;
 
 /* Concurrency tracking state */
 static pthread_mutex_t g_active_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -177,6 +187,200 @@ static void drain_and_close(int client_fd) {
     close(client_fd);
 }
 
+/* The single decision point for "may we talk to this destination at all?", shared by
+ * plain HTTP requests and CONNECT tunnels so both obey exactly the same rules.
+ * Returns 1 to proceed. On refusal it sets the log decision/status and returns 0. */
+static int destination_allowed(const char *host, const char **decision, int *status) {
+    if (policy_check_host(&g_policy, host) != POLICY_ALLOW) {
+        *decision = "blocked_policy";
+        *status = 403;
+        return 0;
+    }
+    return 1;
+}
+
+/* Reads and discards the header lines that follow a CONNECT line, up to the blank line.
+ * Stops exactly at the blank line, so nothing the client sends afterwards (such as a
+ * TLS ClientHello sent early) is consumed -- it stays queued and is relayed untouched. */
+static ReadLineStatus consume_request_headers(int fd) {
+    size_t total = 0, line_len = 0;
+    for (;;) {
+        char c;
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n < 0) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                return LINE_TIMEOUT;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            return LINE_ERROR;
+        }
+        if (n == 0) {
+            return LINE_CLOSED;
+        }
+        if (++total > CONNECT_HEADER_MAX) {
+            return LINE_TOO_LARGE;
+        }
+        if (c == '\n') {
+            if (line_len == 0) {
+                return LINE_OK; /* blank line: end of the headers */
+            }
+            line_len = 0;
+        } else if (c != '\r') {
+            line_len++;
+        }
+    }
+}
+
+/* Copies bytes in both directions between `a` (client) and `b` (origin) until both
+ * directions are finished or the tunnel is idle. The bytes are NEVER examined, stored
+ * or logged -- this is a blind relay, which is what keeps TLS end to end.
+ *
+ * When one side finishes (EOF or error) its peer gets a write-shutdown so it learns
+ * the stream ended, and the other direction keeps flowing until it also finishes or
+ * stays idle for TUNNEL_HALF_CLOSE_SECONDS. Returns the number of bytes relayed. */
+static unsigned long long relay_tunnel(int a, int b, int idle_seconds) {
+    unsigned long long total = 0;
+    int open_dir[2] = {1, 1}; /* [0] = a->b still open, [1] = b->a still open */
+    int fds[2] = {a, b};
+    int timeout_ms = idle_seconds * 1000;
+    char buf[TUNNEL_BUF_LEN];
+
+    while (open_dir[0] || open_dir[1]) {
+        struct pollfd pfd[2];
+        for (int i = 0; i < 2; i++) {
+            pfd[i].fd = open_dir[i] ? fds[i] : -1; /* a negative fd is ignored by poll() */
+            pfd[i].events = POLLIN;
+            pfd[i].revents = 0;
+        }
+        int rc = poll(pfd, 2, timeout_ms);
+        if (rc == 0) {
+            break; /* idle for too long */
+        }
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        for (int i = 0; i < 2; i++) {
+            if (!(pfd[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+                continue;
+            }
+            int src = fds[i], dst = fds[1 - i];
+            ssize_t n = recv(src, buf, sizeof(buf), 0);
+            if (n > 0) {
+                if (send_all(dst, buf, (size_t)n) < 0) {
+                    return total; /* the receiving side is gone */
+                }
+                total += (unsigned long long)n;
+            } else if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                shutdown(dst, SHUT_WR); /* tell the peer this direction is finished */
+                open_dir[i] = 0;
+                if (timeout_ms > TUNNEL_HALF_CLOSE_SECONDS * 1000) {
+                    timeout_ms = TUNNEL_HALF_CLOSE_SECONDS * 1000;
+                }
+            }
+        }
+    }
+    return total;
+}
+
+/* Result of handling a CONNECT request, for the caller's log line. */
+typedef struct {
+    const char *decision;
+    int status;
+    unsigned long long bytes;
+    char host[MAX_HOST_LEN]; /* validated host, or "-" */
+} ConnectOutcome;
+
+/* Handles one CONNECT request end to end. `line` has its CR/LF removed. The caller closes
+ * client_fd. HTTPS is only ever tunnelled: no TLS termination, no certificates, no inspection. */
+static void handle_connect(int client_fd, const char *line, ConnectOutcome *out) {
+    snprintf(out->host, sizeof(out->host), "-");
+    out->decision = "bad_request";
+    out->status = 400;
+    out->bytes = 0;
+
+    ParsedConnect target;
+    ParseStatus ps = parse_connect_request(line, &target);
+    if (ps != PARSE_OK) {
+        char body[256];
+        snprintf(body, sizeof(body), "400 Bad Request: %s\n", parse_status_to_string(ps));
+        send_error_response(client_fd, 400, "Bad Request", body);
+        return;
+    }
+    snprintf(out->host, sizeof(out->host), "%s", target.host);
+
+    ReadLineStatus hs = consume_request_headers(client_fd);
+    if (hs == LINE_TIMEOUT) {
+        send_error_response(client_fd, 408, "Request Timeout", "408 Request Timeout: CONNECT headers incomplete.\n");
+        out->decision = "timeout";
+        out->status = 408;
+        return;
+    }
+    if (hs == LINE_TOO_LARGE) {
+        send_error_response(client_fd, 400, "Bad Request", "400 Bad Request: CONNECT headers too large.\n");
+        return;
+    }
+    if (hs != LINE_OK) {
+        out->decision = "client_closed";
+        out->status = 0;
+        return;
+    }
+
+    /* Only the HTTPS port: CONNECT must not become a way to reach arbitrary services. */
+    if (target.port != g_connect_port) {
+        send_error_response(client_fd, 403, "Forbidden",
+                            "403 Forbidden: CONNECT is only permitted to the HTTPS port.\n");
+        out->decision = "blocked_port";
+        out->status = 403;
+        return;
+    }
+
+    if (!destination_allowed(target.host, &out->decision, &out->status)) {
+        send_error_response(client_fd, 403, "Forbidden", "403 Forbidden: Destination blocked by policy.\n");
+        return;
+    }
+
+    /* Same safe connect as plain HTTP: local names, private/loopback/link-local addresses and
+     * DNS answers are all checked BEFORE the tunnel is created. */
+    int origin_fd = -1;
+    FetchStatus conn = origin_connect(target.host, target.port, &origin_fd);
+    if (conn == FETCH_ERR_UNSAFE_ADDRESS) {
+        send_error_response(client_fd, 403, "Forbidden", "403 Forbidden: Destination address is not permitted.\n");
+        out->decision = "blocked_private";
+        out->status = 403;
+        return;
+    }
+    if (conn != FETCH_OK) {
+        char body[256];
+        snprintf(body, sizeof(body), "502 Bad Gateway: %s\n", fetch_status_to_string(conn));
+        send_error_response(client_fd, 502, "Bad Gateway", body);
+        out->decision = "bad_gateway";
+        out->status = 502;
+        return;
+    }
+
+    struct timeval send_to = {TUNNEL_SEND_TIMEOUT_SECONDS, 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_to, sizeof(send_to));
+    setsockopt(origin_fd, SOL_SOCKET, SO_SNDTIMEO, &send_to, sizeof(send_to));
+
+    static const char established[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    if (send_all(client_fd, established, sizeof(established) - 1) < 0) {
+        close(origin_fd);
+        out->decision = "client_closed";
+        out->status = 0;
+        return;
+    }
+
+    out->decision = "allowed";
+    out->status = 200;
+    out->bytes = relay_tunnel(client_fd, origin_fd, g_tunnel_idle_seconds);
+    close(origin_fd); /* the single close of the origin socket on every path through here */
+}
+
 /* Worker thread entry point: extracts client socket, frees heap arguments,
  * detaches thread, handles the request end-to-end, closes the socket, and
  * decrements the active concurrency count. */
@@ -207,6 +411,7 @@ static void *handle_client(void *arg) {
     const char *log_extras = NULL;
     FetchStats stats;
     memset(&stats, 0, sizeof(stats));
+    ConnectOutcome connect_outcome; /* function scope: log_host may point into it until cleanup */
 
     struct timeval timeout;
     timeout.tv_sec = CLIENT_READ_TIMEOUT_SECONDS;
@@ -243,6 +448,16 @@ static void *handle_client(void *arg) {
         line[--len] = '\0';
     }
 
+    if (request_is_connect(line)) {
+        handle_connect(client_fd, line, &connect_outcome);
+        log_host = connect_outcome.host;
+        log_decision = connect_outcome.decision;
+        log_status = connect_outcome.status;
+        log_bytes = connect_outcome.bytes;
+        log_extras = "method=connect";
+        goto cleanup;
+    }
+
     ParsedUrl parsed;
     ParseStatus parse_status = parse_http_url(line, &parsed);
 
@@ -259,11 +474,9 @@ static void *handle_client(void *arg) {
 
     /* Policy is applied BEFORE any DNS lookup or outbound connection, so a
      * blocked destination is never even resolved. */
-    if (policy_check_host(&g_policy, parsed.host) != POLICY_ALLOW) {
+    if (!destination_allowed(parsed.host, &log_decision, &log_status)) {
         send_error_response(client_fd, 403, "Forbidden",
                             "403 Forbidden: Destination blocked by policy.\n");
-        log_decision = "blocked_policy";
-        log_status = 403;
         goto cleanup;
     }
 
@@ -403,6 +616,28 @@ int main(void) {
         fprintf(stderr, "proxy: WARNING: PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1 -- SSRF protection is "
                         "DISABLED. Use only for local testing.\n");
     }
+
+    const char *cp = getenv("PROXY_CONNECT_PORT");
+    if (cp != NULL && cp[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(cp, &endp, 10);
+        if (*endp != '\0' || v < 1 || v > 65535) {
+            fprintf(stderr, "proxy: error: PROXY_CONNECT_PORT must be a port number (1-65535)\n");
+            return EXIT_FAILURE;
+        }
+        g_connect_port = (unsigned)v;
+    }
+    const char *ti = getenv("PROXY_TUNNEL_IDLE_SECONDS");
+    if (ti != NULL && ti[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(ti, &endp, 10);
+        if (*endp != '\0' || v < 1 || v > 3600) {
+            fprintf(stderr, "proxy: error: PROXY_TUNNEL_IDLE_SECONDS must be 1-3600\n");
+            return EXIT_FAILURE;
+        }
+        g_tunnel_idle_seconds = (int)v;
+    }
+    printf("proxy: CONNECT tunnelling allowed to port %u only\n", g_connect_port);
 
     const char *cache_env = getenv("PROXY_CACHE");
     if (cache_env != NULL && strcmp(cache_env, "0") == 0) {

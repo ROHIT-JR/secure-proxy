@@ -47,6 +47,96 @@ static void test_invalid(const char *url, ParseStatus expected_status) {
     passed_tests++;
 }
 
+
+static void test_connect_ok(const char *line, const char *host, uint16_t port) {
+    total_tests++;
+    ParsedConnect c;
+    memset(&c, 0, sizeof(c));
+    ParseStatus st = parse_connect_request(line, &c);
+    if (st != PARSE_OK) {
+        printf("FAIL: CONNECT '%s' expected PARSE_OK, got %s\n", line, parse_status_to_string(st));
+        return;
+    }
+    if (strcmp(c.host, host) != 0 || c.port != port) {
+        printf("FAIL: CONNECT '%s' expected %s:%u, got %s:%u\n", line, host, port, c.host, c.port);
+        return;
+    }
+    passed_tests++;
+}
+
+static void test_connect_bad(const char *line, ParseStatus expected) {
+    total_tests++;
+    ParsedConnect c;
+    ParseStatus st = parse_connect_request(line, &c);
+    if (st != expected) {
+        printf("FAIL: CONNECT '%s' expected %s, got %s\n", line ? line : "(null)",
+               parse_status_to_string(expected), parse_status_to_string(st));
+        return;
+    }
+    passed_tests++;
+}
+
+static void run_connect_tests(void) {
+    test_connect_ok("CONNECT example.com:443 HTTP/1.1", "example.com", 443);
+    test_connect_ok("CONNECT example.com:443 HTTP/1.0", "example.com", 443);
+    test_connect_ok("CONNECT example.com:443", "example.com", 443);
+    test_connect_ok("CONNECT EXAMPLE.Com:443 HTTP/1.1", "example.com", 443);
+    test_connect_ok("CONNECT sub.example.co.uk:8443 HTTP/1.1", "sub.example.co.uk", 8443);
+    test_connect_ok("CONNECT 93.184.216.34:443 HTTP/1.1", "93.184.216.34", 443);
+    test_connect_ok("CONNECT a:1 HTTP/1.1", "a", 1);
+    test_connect_ok("CONNECT a:65535 HTTP/1.1", "a", 65535);
+    test_connect_ok("CONNECT under_score.test:443 HTTP/1.1", "under_score.test", 443);
+
+    test_connect_bad(NULL, PARSE_ERR_MALFORMED);
+    test_connect_bad("GET http://example.com/ HTTP/1.1", PARSE_ERR_MALFORMED);
+    test_connect_bad("connect example.com:443 HTTP/1.1", PARSE_ERR_MALFORMED); /* method is case-sensitive */
+    test_connect_bad("CONNECT", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT ", PARSE_ERR_EMPTY_HOST);
+    test_connect_bad("CONNECT  example.com:443", PARSE_ERR_EMPTY_HOST);
+    test_connect_bad("CONNECT example.com", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:abc", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:0", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:65536", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:-1", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:443x", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT example.com:0000443", PARSE_ERR_INVALID_PORT);
+    test_connect_bad("CONNECT :443", PARSE_ERR_EMPTY_HOST);
+    test_connect_bad("CONNECT example.com:443:80", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT ::1:443", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT [::1]:443", PARSE_ERR_INVALID_HOST);
+    test_connect_bad("CONNECT user@example.com:443", PARSE_ERR_CREDENTIALS);
+    test_connect_bad("CONNECT user:pw@example.com:443", PARSE_ERR_CREDENTIALS);
+    test_connect_bad("CONNECT example.com/path:443", PARSE_ERR_INVALID_HOST);
+    test_connect_bad("CONNECT exa mple.com:443", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT example.com:443 HTTP/2", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT example.com:443 HTTP/1.1 extra", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT example.com:443 FTP/1.1", PARSE_ERR_MALFORMED);
+    test_connect_bad("CONNECT exam!ple.com:443", PARSE_ERR_INVALID_HOST);
+    test_connect_bad("CONNECT example.com:443\r", PARSE_ERR_CONTROL_CHAR);
+    test_connect_bad("CONNECT exa\tmple.com:443", PARSE_ERR_CONTROL_CHAR);
+
+    char long_host[400];
+    strcpy(long_host, "CONNECT ");
+    memset(long_host + 8, 'a', 300);
+    strcpy(long_host + 308, ":443");
+    test_connect_bad(long_host, PARSE_ERR_HOST_TOO_LONG);
+
+    static char huge[MAX_URL_LEN + 64];
+    strcpy(huge, "CONNECT ");
+    memset(huge + 8, 'a', sizeof(huge) - 9);
+    huge[sizeof(huge) - 1] = '\0';
+    test_connect_bad(huge, PARSE_ERR_OVERLONG);
+
+    total_tests++;
+    if (request_is_connect("CONNECT x:1") && !request_is_connect("CONNECTX") && !request_is_connect("GET") &&
+        !request_is_connect(NULL)) {
+        passed_tests++;
+    } else {
+        printf("FAIL: request_is_connect misclassified an input\n");
+    }
+}
+
 int main(void) {
     printf("=== Running URL Parser Unit Tests ===\n");
 
@@ -92,6 +182,8 @@ int main(void) {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     test_invalid(long_host_url, PARSE_ERR_HOST_TOO_LONG);
+
+    run_connect_tests();
 
     printf("Result: %d / %d tests passed successfully.\n", passed_tests, total_tests);
     return (passed_tests == total_tests) ? 0 : 1;

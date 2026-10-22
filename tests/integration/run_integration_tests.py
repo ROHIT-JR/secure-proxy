@@ -15,6 +15,7 @@ import http.server
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -580,6 +581,314 @@ def test_response_cache(tmp_dir):
         stop_proxy(proc)
 
 
+# ---------------- HTTPS CONNECT tunnelling ----------------
+
+class EchoServer:
+    """Binary-safe TCP echo origin. Counts connections and how many ended because the
+    PROXY closed/shut down its side (i.e. the tunnel noticed the client had gone)."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(32)
+        self.port = self.sock.getsockname()[1]
+        self.accepted = 0
+        self.eof_from_proxy = 0
+        self._stop = False
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        self.sock.settimeout(0.2)
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            self.accepted += 1
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    self.eof_from_proxy += 1
+                    break
+                if data.startswith(b"CLOSE-ME"):
+                    break  # the ORIGIN hangs up first
+                conn.sendall(data)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def close(self):
+        self._stop = True
+        self.sock.close()
+
+
+def open_tunnel(target, headers="Host: x\r\n", extra=b""):
+    """Connects to the proxy, sends CONNECT, returns (socket, first_response_bytes)."""
+    s = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=6)
+    s.sendall(f"CONNECT {target} HTTP/1.1\r\n{headers}\r\n".encode() + extra)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    return s, buf
+
+
+def read_all_until_eof(sock, timeout):
+    sock.settimeout(timeout)
+    data = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                return data, True
+            data += chunk
+    except socket.timeout:
+        return data, False
+
+
+def test_connect_tunnel(tmp_dir):
+    echo = EchoServer()
+    counter = ConnectionCounter()
+    block = write_rules(tmp_dir, "tunnel_block.txt", "blocked-tunnel.test\n")
+    log_path = Path(tmp_dir) / "tunnel.log"
+    proc = start_proxy(log_path, {"PROXY_CONNECT_PORT": str(echo.port), "PROXY_BLOCKLIST": str(block),
+                                  "PROXY_TUNNEL_IDLE_SECONDS": "2"}, tmp_dir)
+    try:
+        baseline_fds = proxy_fd_count(proc.pid)
+
+        # --- establishing and relaying ---
+        t, first = open_tunnel(f"127.0.0.1:{echo.port}")
+        report("CONNECT to a permitted destination answers 200 Connection Established",
+               first == b"HTTP/1.1 200 Connection Established\r\n\r\n", first[:60])
+        payload = os.urandom(1024 * 1024)  # random binary, including bytes that are not valid text
+        sender = threading.Thread(target=lambda: t.sendall(payload))
+        sender.start()
+        got = b""
+        t.settimeout(10)
+        while len(got) < len(payload):
+            chunk = t.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+        sender.join()
+        report("1 MiB of random binary data survives the tunnel unchanged in both directions", got == payload,
+               f"got {len(got)} of {len(payload)} bytes")
+        t.close()
+
+        # a client that sends data in the same packet as the CONNECT headers (TLS clients may)
+        t, first = open_tunnel(f"127.0.0.1:{echo.port}", extra=b"EARLY-BYTES-123")
+        t.settimeout(5)
+        early = t.recv(100)
+        report("bytes sent right behind the CONNECT headers are relayed, not swallowed",
+               early == b"EARLY-BYTES-123" or first.endswith(b"EARLY-BYTES-123"), early)
+        t.close()
+
+        # --- both sockets close when either side disconnects ---
+        before = echo.eof_from_proxy
+        t, _ = open_tunnel(f"127.0.0.1:{echo.port}")
+        t.sendall(b"hello")
+        t.recv(10)
+        t.close()  # the client vanishes
+        # PROMPT (well inside the 2 s idle timeout, so the idle timer cannot be what closed it)
+        deadline = time.time() + 1.0
+        while echo.eof_from_proxy == before and time.time() < deadline:
+            time.sleep(0.05)
+        report("client disconnects -> the origin side is closed promptly too", echo.eof_from_proxy > before)
+
+        t, _ = open_tunnel(f"127.0.0.1:{echo.port}")
+        t.sendall(b"CLOSE-ME")  # the origin hangs up
+        t0 = time.time()
+        _, eof = read_all_until_eof(t, 1.0)  # promptly, i.e. NOT via the 2 s idle timeout
+        report("origin disconnects -> the client side is closed promptly too", eof, f"eof={eof} after {time.time() - t0:.1f}s")
+        t.close()
+
+        t, _ = open_tunnel(f"127.0.0.1:{echo.port}")
+        t0 = time.time()
+        _, eof = read_all_until_eof(t, 8)
+        took = time.time() - t0
+        report("an idle tunnel is closed after the idle timeout", eof and 1.0 < took < 6.0, f"eof={eof} after {took:.1f}s")
+        t.close()
+
+        time.sleep(0.5)
+        report("no leaked file descriptors after tunnels end (clean, abrupt and idle)",
+               proxy_fd_count(proc.pid) <= baseline_fds, f"baseline={baseline_fds} now={proxy_fd_count(proc.pid)}")
+
+        # --- refused BEFORE any tunnel is created ---
+        accepted_before = echo.accepted
+        cases = {
+            "wrong port (CONNECT may only reach the HTTPS port)": f"127.0.0.1:{counter.port}",
+            "port 22": "127.0.0.1:22",
+            "blocklisted host": f"blocked-tunnel.test:{echo.port}",
+        }
+        bad = []
+        for label, target in cases.items():
+            s2, resp = open_tunnel(target)
+            if not resp.startswith(b"HTTP/1.1 403"):
+                bad.append(f"{label} -> {resp[:40]}")
+            s2.close()
+        report("wrong-port and blocklisted CONNECT targets get 403", not bad, "; ".join(bad))
+        s2, resp = open_tunnel(f"does-not-exist.invalid:{echo.port}")
+        report("CONNECT to an unresolvable name gets 502", resp.startswith(b"HTTP/1.1 502"), resp[:40])
+        s2.close()
+        time.sleep(0.3)
+        report("refused CONNECTs never reached any origin", counter.count == 0 and echo.accepted == accepted_before,
+               f"counter={counter.count}, echo accepted +{echo.accepted - accepted_before}")
+
+        # --- malformed requests ---
+        malformed = ["CONNECT", "CONNECT example.com", "CONNECT example.com:abc", "CONNECT example.com:0",
+                     "CONNECT example.com:99999", "CONNECT user@example.com:443", "CONNECT [::1]:443",
+                     "CONNECT example.com:443:80", "CONNECT example.com:443 HTTP/9"]
+        bad = []
+        for line in malformed:
+            s2 = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=5)
+            s2.sendall(f"{line}\r\n\r\n".encode())
+            data, _ = read_all_until_eof(s2, 3)
+            if not data.startswith(b"HTTP/1.1 400"):
+                bad.append(f"{line!r} -> {data[:30]!r}")
+            s2.close()
+        report("malformed CONNECT lines are rejected with 400", not bad, "; ".join(bad))
+        s2 = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=5)
+        s2.sendall(f"CONNECT 127.0.0.1:{echo.port} HTTP/1.1\r\n".encode() + b"X-Pad: " + b"a" * 20000 + b"\r\n\r\n")
+        data, _ = read_all_until_eof(s2, 3)
+        report("oversized CONNECT headers are rejected", data.startswith(b"HTTP/1.1 400"), data[:30])
+        s2.close()
+        ok = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+        report("the proxy still serves normal requests after all of that", b"fixture: index page" in ok)
+
+        # --- logging: metadata only ---
+        time.sleep(0.3)
+        log = Path(log_path).read_text()
+        report("tunnels are logged as method=connect with status and byte count, no content",
+               "host=127.0.0.1 decision=allowed status=200" in log and "method=connect" in log
+               and "EARLY-BYTES" not in log and "hello" not in log and "CLOSE-ME" not in log and "X-Pad" not in log)
+        lines = [l for l in log.splitlines() if l]
+        report("every tunnel log line is well formed", all(LOG_LINE_RE.match(l) for l in lines),
+               [l for l in lines if not LOG_LINE_RE.match(l)][:2])
+    finally:
+        stop_proxy(proc)
+        echo.close()
+        counter.close()
+
+
+def make_self_signed_cert(tmp_dir):
+    key, cert = Path(tmp_dir) / "tls_key.pem", Path(tmp_dir) / "tls_cert.pem"
+    r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+                        "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"],
+                       capture_output=True, timeout=60)
+    return (key, cert) if r.returncode == 0 else None
+
+
+def test_connect_real_tls(tmp_dir):
+    """A genuine TLS handshake through the tunnel. If the proxy terminated or inspected TLS it
+    would have to present its own certificate; the client instead sees the origin's exact one."""
+    pair = None
+    try:
+        pair = make_self_signed_cert(tmp_dir)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if pair is None:
+        print("[SKIP] real TLS through CONNECT (the openssl command is not available)")
+        return
+    key, cert = pair
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    sctx.load_cert_chain(str(cert), str(key))
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    tls_port = srv.getsockname()[1]
+    server_saw = []
+
+    def serve():
+        srv.settimeout(0.2)
+        stop_at = time.time() + 30
+        while time.time() < stop_at:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            try:
+                tconn = sctx.wrap_socket(conn, server_side=True)
+                server_saw.append(tconn.recv(4096))
+                tconn.sendall(b"HTTP/1.0 200 OK\r\n\r\ntls-secret-response")
+                tconn.close()
+            except (ssl.SSLError, OSError):
+                conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    log_path = Path(tmp_dir) / "tls.log"
+    proc = start_proxy(log_path, {"PROXY_CONNECT_PORT": str(tls_port)}, tmp_dir)
+    try:
+        raw, first = open_tunnel(f"127.0.0.1:{tls_port}")
+        ctx = ssl.create_default_context(cafile=str(cert))  # trust ONLY the origin's certificate
+        ctx.check_hostname = False
+        handshake_ok = False
+        peer_der = b""
+        reply = b""
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname="localhost")
+            handshake_ok = True
+            peer_der = tls.getpeercert(binary_form=True)
+            tls.sendall(b"GET /private-path?token=very-secret HTTP/1.0\r\n\r\n")
+            reply, _ = read_all_until_eof(tls, 5)
+            tls.close()
+        except (ssl.SSLError, OSError) as e:
+            first = first + str(e).encode()
+        expected_der = ssl.PEM_cert_to_DER_cert(Path(cert).read_text())
+        report("a real TLS handshake succeeds through the tunnel", handshake_ok, first[:80])
+        report("the client sees the ORIGIN's own certificate (no interception, no substitute certificate)",
+               peer_der == expected_der)
+        report("the encrypted exchange completes end to end",
+               b"tls-secret-response" in reply and server_saw and b"very-secret" in server_saw[0])
+        time.sleep(0.3)
+        log = Path(log_path).read_text()
+        report("the proxy never saw or logged the decrypted request",
+               "very-secret" not in log and "private-path" not in log and "tls-secret" not in log
+               and "GET" not in log)
+    finally:
+        stop_proxy(proc)
+        srv.close()
+
+
+def test_connect_blocks_private_networks(tmp_dir):
+    counter = ConnectionCounter()
+    log_path = Path(tmp_dir) / "tunnel_ssrf.log"
+    # port 443 is allowed here, but the NO-override proxy must still refuse private destinations
+    proc = start_proxy(log_path, {"PROXY_CONNECT_PORT": str(counter.port)}, tmp_dir, private_ok=False)
+    try:
+        targets = [f"127.0.0.1:{counter.port}", f"localhost:{counter.port}", f"2130706433:{counter.port}",
+                   f"0x7f.1:{counter.port}", f"10.0.0.1:{counter.port}", f"169.254.169.254:{counter.port}",
+                   f"192.168.1.1:{counter.port}"]
+        bad, slow = [], []
+        for target in targets:
+            t0 = time.time()
+            s2, resp = open_tunnel(target)
+            took = time.time() - t0
+            if not resp.startswith(b"HTTP/1.1 403"):
+                bad.append(f"{target} -> {resp[:30]!r}")
+            if took > 2:
+                slow.append(target)
+            s2.close()
+        time.sleep(0.3)
+        report("CONNECT to loopback/private/metadata destinations is refused with 403 before any tunnel",
+               not bad, "; ".join(bad))
+        report("those refusals are immediate and made no TCP connection", not slow and counter.count == 0,
+               f"slow={slow}, connections={counter.count}")
+        report("refusals are logged as method=connect decision=blocked_private",
+               "decision=blocked_private status=403 bytes=0" in Path(log_path).read_text()
+               and "method=connect" in Path(log_path).read_text())
+    finally:
+        stop_proxy(proc)
+        counter.close()
+
+
 def test_policy_startup_errors(tmp_dir):
     env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
                PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
@@ -614,6 +923,9 @@ def main():
         test_policy_allowlist(tmp_dir)
         test_policy_startup_errors(tmp_dir)
         test_response_cache(tmp_dir)
+        test_connect_tunnel(tmp_dir)
+        test_connect_real_tls(tmp_dir)
+        test_connect_blocks_private_networks(tmp_dir)
         test_ssrf_protection(tmp_dir)
         test_ssrf_override_is_loud(tmp_dir)
     finally:

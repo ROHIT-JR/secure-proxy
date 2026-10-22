@@ -30,6 +30,7 @@ This document describes what SecureBrowse protects, who it protects against, how
 - Every destination address is checked against the allowed-network policy below, both when a name is resolved and again immediately before (and just after) connecting. Names are resolved exactly once and the checked address is the one used, which defeats DNS rebinding by construction (Issue 11; see "Allowed-network policy").
 - Logs record only the validated hostname — never credentials, query strings, fragments, paths, or the raw request line — are written with owner-only permissions, and cannot be interleaved or forged by hostile input (Issue 9; see `docs/logging.md`).
 - The cache never stores responses containing `Set-Cookie`, `Authorization`, unapproved cache-control directives, partial bodies, non-200 statuses, or responses to URLs with a query string; it is bounded (entries, bytes, per-entry size, lifetime) and consulted only after the policy and network-safety checks (Issue 12; see `docs/cache.md`).
+- `CONNECT` tunnels are limited to the HTTPS port, go through the same policy and network-safety checks as plain requests *before* the tunnel exists, are bounded by the worker limit and an idle timeout, and are relayed blindly: the bytes are never examined, stored or logged (Issue 13; see `docs/https-tunnelling.md`).
 - The reputation provider only ever receives the normalised hostname, never full URLs, credentials, or request bodies (Issue 14).
 - Every request has a maximum size and a connection timeout, so a slow or oversized client cannot tie up a worker thread indefinitely.
 
@@ -68,7 +69,7 @@ The client only ever sees `403 Forbidden: Destination address is not permitted.`
 
 ## Explicit non-goals
 
-- **No transparent HTTPS (Hypertext Transfer Protocol Secure) interception.** SecureBrowse does not generate TLS (Transport Layer Security) certificates, does not perform a "man-in-the-middle" on HTTPS traffic, and does not decrypt or inspect HTTPS content. HTTPS is handled purely via `CONNECT` tunnelling: the proxy relays encrypted bytes between client and origin without reading them.
+- **No transparent HTTPS (Hypertext Transfer Protocol Secure) interception.** SecureBrowse does not generate TLS (Transport Layer Security) certificates, does not perform a "man-in-the-middle" on HTTPS traffic, and does not decrypt or inspect HTTPS content. HTTPS is handled purely via `CONNECT` tunnelling: the proxy relays encrypted bytes between client and origin without reading them. This is implemented and tested with a real TLS handshake through the tunnel: the client sees the origin's own certificate and the proxy's log never contains the decrypted request (see `docs/https-tunnelling.md`).
 - **Not a replacement for a commercial secure web gateway.** SecureBrowse does not claim enterprise-grade threat coverage, does not do deep packet inspection, and is not hardened against a determined, well-resourced attacker.
 - **No content filtering beyond hostname-level policy.** SecureBrowse decides based on hostname and address, not on page content.
 
