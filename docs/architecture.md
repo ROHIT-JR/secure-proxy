@@ -32,6 +32,8 @@ The proxy is both a **TCP (Transmission Control Protocol) server** (it accepts c
 | `src/cache.c/.h` | Thread-safe, bounded response cache for eligible GET requests. |
 | `src/logger.c/.h` | Mutex-protected, privacy-aware structured logging. |
 | `src/reputation.c/.h` | Pluggable `ReputationProvider` interface (offline fixture provider by default). |
+| `src/decision.c/.h` | Pure risk-scoring function: combines policy, network and reputation signals into allow/block plus a safe reason category. |
+| `include/` | All public headers (`policy.h`, `cache.h`, `logger.h`, `reputation.h`, `decision.h`, `origin_client.h`, `request_parser.h`, `util.h`). |
 | `src/util.c/.h` | Small shared helpers: bounded string copies, `send_all()`. |
 | `src/client.c` | Command-line test client used for manual and integration testing. |
 

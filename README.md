@@ -92,6 +92,39 @@ $ ./bin/client http://example.com/
 Saved response to example.com.html (1256 bytes)
 ```
 
+## Configuration
+
+All settings are environment variables; with none set the proxy is in its secure default state.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PROXY_PORT` | 8080 | Listening port (also read by `bin/client`). |
+| `PROXY_CONNECT_PORT` | 443 | The only port `CONNECT` tunnels may reach. |
+| `PROXY_TUNNEL_IDLE_SECONDS` | 60 | Idle timeout for tunnels. |
+| `PROXY_ORIGIN_CONNECT_TIMEOUT_SECONDS` | 10 | Origin connect timeout. |
+| `PROXY_ORIGIN_READ_TIMEOUT_SECONDS` | 15 | Origin silence timeout (`504`). |
+| `PROXY_ALLOWLIST` / `PROXY_BLOCKLIST` | unset | Policy files (see `docs/policy.md`). |
+| `PROXY_LOG_FILE` | unset | Privacy-aware request log (mode 600). |
+| `PROXY_CACHE` | on | Set to `0` to disable the cache. |
+| `PROXY_REPUTATION_FIXTURE` | unset | Offline reputation fixture file. |
+| `PROXY_REPUTATION_TIMEOUT_MS` / `PROXY_REPUTATION_TTL_SECONDS` | see docs | Reputation timeout and cache lifetime. |
+| `PROXY_REPUTATION_QUERY_LOG` | unset | Records what was sent to the provider (tests). |
+| `PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS` | unset | **Testing only**: disables the SSRF guard; the proxy warns loudly. |
+
+## Known limits
+
+- Thread-per-connection with a 64-client cap; not built for production scale.
+- The reputation check fails open if the provider is unavailable.
+- The live threat-feed adapter (Issue 16) is not built; only the interface and offline fixture exist.
+- Valgrind has a CI job but was not run locally; sanitizers were.
+- HTTPS is tunnelled, never inspected.
+
+## Demo and viva
+
+- Five-minute demo with exact commands: [`docs/demo.md`](docs/demo.md) (`make demo-check` verifies it).
+- Viva preparation: [`docs/viva.md`](docs/viva.md).
+- All docs: [`architecture`](docs/architecture.md), [`threat-model`](docs/threat-model.md), [`testing`](docs/testing.md), [`policy`](docs/policy.md), [`logging`](docs/logging.md), [`cache`](docs/cache.md), [`https-tunnelling`](docs/https-tunnelling.md), [`reputation`](docs/reputation.md), [`risk-scoring`](docs/risk-scoring.md).
+
 ## Safe-use limits
 
 This project follows strict rules to stay safe and testable:
