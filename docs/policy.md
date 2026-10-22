@@ -47,7 +47,7 @@ Before matching, the host is normalised: lowercased, a trailing dot removed (`ex
 
 ## What the client sees, and what is logged
 
-The client receives `403 Forbidden: Destination blocked by policy.` — it does not say which rule matched or where the files are. The request log records `decision=blocked_policy status=403` with the (validated) host. See [`logging.md`](logging.md).
+The client receives a `403 Forbidden` page whose reason category is "Blocked by access policy" and which shows the request ID (see [`risk-scoring.md`](risk-scoring.md)). It does not say which rule matched or where the files are. The request log records `decision=blocked_policy status=403` with the (validated) host. See [`logging.md`](logging.md).
 
 ## What the tests prove
 
