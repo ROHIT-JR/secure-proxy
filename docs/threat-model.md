@@ -34,6 +34,7 @@ This document describes what SecureBrowse protects, who it protects against, how
 - Blocked requests get a page that names only a safe reason category and the request ID; rules, addresses, provider answers and scores stay in the server log, and nothing the client sent is echoed back (Issue 16; see `docs/risk-scoring.md`).
 - A slow, failing or hung reputation provider cannot stall the proxy: lookups have a timeout, a bound on outstanding calls, and a short failure cache, and "unavailable" is logged as an event instead of being treated as a verdict (Issue 14; see `docs/reputation.md`).
 - The reputation provider only ever receives the normalised hostname, never full URLs, credentials, or request bodies (Issue 14).
+- A NUL byte in a request line is rejected outright, so a client cannot hide bytes from the validator by ending the C string early (found by the hostile-input battery; see `docs/testing.md`).
 - Every request has a maximum size and a connection timeout, so a slow or oversized client cannot tie up a worker thread indefinitely.
 
 ## Allowed-network policy

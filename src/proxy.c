@@ -34,6 +34,7 @@
 #define TUNNEL_DEFAULT_IDLE_SECONDS 120   /* an idle tunnel is closed after this long */
 #define TUNNEL_HALF_CLOSE_SECONDS 5       /* grace once one side has finished and closed */
 #define TUNNEL_BUF_LEN 16384
+#define SHUTDOWN_WAIT_MS 3000            /* how long a graceful shutdown waits for running requests */
 #define TUNNEL_SEND_TIMEOUT_SECONDS 30
 #define DEFAULT_ALLOWLIST_PATH "config/allowlist.txt"
 #define DEFAULT_BLOCKLIST_PATH "config/blocklist.txt"
@@ -63,6 +64,14 @@ static void extras_add(LogExtras *e, const char *token) {
     memcpy(e->text + used, token, strlen(token) + 1);
 }
 
+/* Set by SIGTERM/SIGINT: stop accepting, let running requests finish (briefly), clean up, exit 0. */
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_stop_signal(int sig) {
+    (void)sig;
+    g_stop = 1;
+}
+
 static unsigned g_connect_port = CONNECT_DEFAULT_PORT;
 static int g_tunnel_idle_seconds = TUNNEL_DEFAULT_IDLE_SECONDS;
 
@@ -75,7 +84,8 @@ typedef enum {
     LINE_TOO_LARGE,
     LINE_TIMEOUT,
     LINE_CLOSED,
-    LINE_ERROR
+    LINE_ERROR,
+    LINE_BAD_BYTES /* the line contains a NUL byte */
 } ReadLineStatus;
 
 /* Creates, binds, and starts listening on a TCP socket for LISTEN_PORT.
@@ -141,6 +151,13 @@ static ReadLineStatus read_request_line(int client_fd, char *buf, size_t buf_len
         }
         if (n == 0) {
             return LINE_CLOSED;
+        }
+
+        /* A NUL byte would end the C string early, hiding everything after it from the
+         * validator while the rest of the line is still "there" on the wire. Refuse it outright
+         * so what is validated is exactly what was sent. */
+        if (buf[used] == '\0') {
+            return LINE_BAD_BYTES;
         }
 
         used += (size_t)n;
@@ -508,6 +525,12 @@ static void *handle_client(void *arg) {
             log_decision = "timeout";
             log_status = 408;
             goto cleanup;
+        case LINE_BAD_BYTES:
+            send_error_response(client_fd, 400, "Bad Request",
+                                "400 Bad Request: Request contains forbidden control characters.\n");
+            log_decision = "bad_request";
+            log_status = 400;
+            goto cleanup;
         case LINE_CLOSED:
         case LINE_ERROR:
             /* Client disconnected or the socket errored; nothing to reply to. */
@@ -615,6 +638,17 @@ static void *handle_client(void *arg) {
         send_error_response(client_fd, 502, "Bad Gateway", body);
         log_decision = "bad_gateway";
         log_status = 502;
+    } else if (fetch_status == FETCH_ERR_TIMEOUT && stats.bytes_relayed == 0) {
+        /* The origin accepted the connection but never answered. Nothing has reached the client
+         * yet, so it is safe to send our own response. */
+        send_error_response(client_fd, 504, "Gateway Timeout", "504 Gateway Timeout: The origin did not respond in time.\n");
+        log_decision = "gateway_timeout";
+        log_status = 504;
+    } else if (fetch_status == FETCH_ERR_RECV && stats.bytes_relayed == 0) {
+        /* The origin hung up (or the read failed) before sending anything. */
+        send_error_response(client_fd, 502, "Bad Gateway", "502 Bad Gateway: The origin sent no response.\n");
+        log_decision = "bad_gateway";
+        log_status = 502;
     } else if (fetch_status == FETCH_OK) {
         log_decision = "allowed";
         log_status = stats.origin_status;
@@ -654,6 +688,14 @@ int main(void) {
      * process with SIGPIPE; failed writes are handled via send()'s
      * return value instead. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* No SA_RESTART on purpose: a blocked accept() must return EINTR so the loop can notice g_stop. */
+    struct sigaction stop_action;
+    memset(&stop_action, 0, sizeof(stop_action));
+    stop_action.sa_handler = on_stop_signal;
+    sigemptyset(&stop_action.sa_mask);
+    sigaction(SIGTERM, &stop_action, NULL);
+    sigaction(SIGINT, &stop_action, NULL);
 
     /* A log file that can't be opened must never stop the proxy from serving. */
     const char *log_path = getenv("PROXY_LOG_FILE");
@@ -701,6 +743,31 @@ int main(void) {
         origin_client_set_allow_private(1);
         fprintf(stderr, "proxy: WARNING: PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1 -- SSRF protection is "
                         "DISABLED. Use only for local testing.\n");
+    }
+
+    {
+        int connect_s = 0, read_s = 0;
+        const char *e = getenv("PROXY_ORIGIN_CONNECT_TIMEOUT_SECONDS");
+        if (e != NULL && e[0] != '\0') {
+            char *endp = NULL;
+            long v = strtol(e, &endp, 10);
+            if (*endp != '\0' || v < 1 || v > 60) {
+                fprintf(stderr, "proxy: error: PROXY_ORIGIN_CONNECT_TIMEOUT_SECONDS must be 1-60\n");
+                return EXIT_FAILURE;
+            }
+            connect_s = (int)v;
+        }
+        e = getenv("PROXY_ORIGIN_READ_TIMEOUT_SECONDS");
+        if (e != NULL && e[0] != '\0') {
+            char *endp = NULL;
+            long v = strtol(e, &endp, 10);
+            if (*endp != '\0' || v < 1 || v > 300) {
+                fprintf(stderr, "proxy: error: PROXY_ORIGIN_READ_TIMEOUT_SECONDS must be 1-300\n");
+                return EXIT_FAILURE;
+            }
+            read_s = (int)v;
+        }
+        origin_client_set_timeouts(connect_s, read_s);
     }
 
     const char *cp = getenv("PROXY_CONNECT_PORT");
@@ -773,7 +840,7 @@ int main(void) {
     printf("proxy: listening on port %d\n", LISTEN_PORT);
     fflush(stdout); /* stdout is fully buffered when not a tty (e.g. redirected to a log file) */
 
-    while (1) {
+    while (!g_stop) {
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) {
@@ -824,9 +891,23 @@ int main(void) {
         }
     }
 
+    /* Graceful shutdown: no new clients, give running requests a short time to finish. */
     close(listen_fd);
+    for (int waited_ms = 0; waited_ms < SHUTDOWN_WAIT_MS; waited_ms += 50) {
+        pthread_mutex_lock(&g_active_clients_mutex);
+        int active = g_active_clients;
+        pthread_mutex_unlock(&g_active_clients_mutex);
+        if (active == 0) {
+            break;
+        }
+        struct timespec nap = {0, 50 * 1000 * 1000};
+        nanosleep(&nap, NULL);
+    }
+    printf("proxy: shut down\n");
+    fflush(stdout);
     reputation_shutdown();
     cache_destroy();
     policy_free(&g_policy);
+    logger_close();
     return 0;
 }

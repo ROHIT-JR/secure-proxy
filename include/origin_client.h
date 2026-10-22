@@ -9,7 +9,8 @@ typedef enum {
     FETCH_ERR_CONNECT,
     FETCH_ERR_SEND,
     FETCH_ERR_RECV,
-    FETCH_ERR_UNSAFE_ADDRESS /* destination is (or resolves to) a loopback/private/link-local/... address */
+    FETCH_ERR_UNSAFE_ADDRESS, /* destination is (or resolves to) a loopback/private/link-local/... address */
+    FETCH_ERR_TIMEOUT         /* the origin accepted the connection but stopped sending for too long */
 } FetchStatus;
 
 /* Optional facts about a fetch, filled in by fetch_and_relay() for logging. */
@@ -75,3 +76,10 @@ FetchStatus origin_connect(const char *host, unsigned port, int *out_fd);
  * sets PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1, and then prints a loud warning.
  */
 void origin_client_set_allow_private(int allow);
+
+/*
+ * Sets how long the proxy waits for an origin: connect_seconds for the TCP connection,
+ * read_seconds of silence while waiting for (more of) the response. Values below 1 are
+ * ignored. Defaults: 5 and 10. Call before worker threads start.
+ */
+void origin_client_set_timeouts(int connect_seconds, int read_seconds);

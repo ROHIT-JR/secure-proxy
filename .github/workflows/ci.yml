@@ -22,6 +22,9 @@ jobs:
       - name: Run test suite
         run: make test
 
+      - name: Run concurrent load test
+        run: make load-test
+
   sanitize:
     name: AddressSanitizer + UndefinedBehaviorSanitizer
     runs-on: ubuntu-latest
@@ -34,3 +37,23 @@ jobs:
 
       - name: Run test suite under sanitizers
         run: make test
+
+      - name: Run concurrent load test under sanitizers (also checks for leaks at shutdown)
+        run: make load-test-sanitize
+
+  valgrind:
+    # Non-blocking: reports memory errors found by Valgrind without failing the pull request.
+    # (It was added without being run on a machine with Valgrind installed, so treat its first
+    # results as a check of the job itself as well as of the code.)
+    name: Valgrind (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Run unit tests and a short load test under Valgrind
+        run: make valgrind

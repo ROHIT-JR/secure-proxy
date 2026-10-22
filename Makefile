@@ -102,7 +102,36 @@ test: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TAR
 sanitize: CFLAGS += -fsanitize=address,undefined -g
 sanitize: clean all test
 
+# Concurrent load against the normal build. Deterministic for a given seed:
+#   make load-test SEED=7
+SEED ?= 1
+load-test: clean all
+	python3 tests/load/run_load_test.py --seed $(SEED)
+
+# The same load against an AddressSanitizer + UndefinedBehaviorSanitizer build. The proxy shuts
+# down gracefully on SIGTERM, so LeakSanitizer reports on the proxy itself at exit. The sanitizer
+# inflates memory use, hence the larger allowance.
+load-test-sanitize: CFLAGS += -fsanitize=address,undefined -g
+load-test-sanitize: clean all
+	python3 tests/load/run_load_test.py --seed $(SEED) --max-rss-growth-mb 800
+
+# Unit tests plus a shortened load test under Valgrind, where Valgrind is installed.
+valgrind: clean all
+	@if command -v valgrind >/dev/null 2>&1; then \
+	    set -e; \
+	    for t in $(TEST_TARGET) $(LOGGER_TEST_TARGET) $(POLICY_TEST_TARGET) $(CACHE_TEST_TARGET) $(DECISION_TEST_TARGET) $(REP_TEST_TARGET); do \
+	        echo "== valgrind $$t"; \
+	        valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite -q ./$$t; \
+	    done; \
+	    echo "== valgrind: proxy under load"; \
+	    PROXY_WRAPPER="valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite -q" \
+	        python3 tests/load/run_load_test.py --seed $(SEED) --clients 8 --requests-per-client 40 \
+	        --max-rss-growth-mb 800 --startup-timeout 120; \
+	else \
+	    echo "valgrind is not installed here; skipping (run: sudo apt-get install valgrind)"; \
+	fi
+
 clean:
 	rm -rf $(BIN_DIR) src/*.o tests/*.o *.o
 
-.PHONY: all test sanitize clean
+.PHONY: all test sanitize clean load-test load-test-sanitize valgrind

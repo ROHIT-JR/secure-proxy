@@ -21,9 +21,21 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define ORIGIN_CONNECT_TIMEOUT_SECONDS 5
-#define ORIGIN_READ_TIMEOUT_SECONDS 10
+#define DEFAULT_CONNECT_TIMEOUT_SECONDS 5
+#define DEFAULT_READ_TIMEOUT_SECONDS 10
 #define RELAY_CHUNK_SIZE 8192
+
+static int g_connect_timeout_seconds = DEFAULT_CONNECT_TIMEOUT_SECONDS; /* set once at startup */
+static int g_read_timeout_seconds = DEFAULT_READ_TIMEOUT_SECONDS;
+
+void origin_client_set_timeouts(int connect_seconds, int read_seconds) {
+    if (connect_seconds >= 1) {
+        g_connect_timeout_seconds = connect_seconds;
+    }
+    if (read_seconds >= 1) {
+        g_read_timeout_seconds = read_seconds;
+    }
+}
 
 const char *fetch_status_to_string(FetchStatus status) {
     switch (status) {
@@ -33,6 +45,7 @@ const char *fetch_status_to_string(FetchStatus status) {
         case FETCH_ERR_SEND: return "Failed to send request or relay response to output";
         case FETCH_ERR_RECV: return "Failed to read response from origin";
         case FETCH_ERR_UNSAFE_ADDRESS: return "Destination address is not permitted";
+        case FETCH_ERR_TIMEOUT: return "Origin did not respond in time";
         default: return "Unknown fetch error";
     }
 }
@@ -145,7 +158,7 @@ FetchStatus origin_connect(const char *host, unsigned port, int *out_fd) {
         if (fd < 0) {
             continue;
         }
-        if (connect_with_timeout(fd, rp->ai_addr, rp->ai_addrlen, ORIGIN_CONNECT_TIMEOUT_SECONDS) == 0) {
+        if (connect_with_timeout(fd, rp->ai_addr, rp->ai_addrlen, g_connect_timeout_seconds) == 0) {
             /* Verify the peer we actually reached, not just the one we meant to reach. */
             struct sockaddr_storage peer;
             socklen_t peer_len = sizeof(peer);
@@ -201,7 +214,7 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats)
     }
 
     struct timeval read_timeout;
-    read_timeout.tv_sec = ORIGIN_READ_TIMEOUT_SECONDS;
+    read_timeout.tv_sec = g_read_timeout_seconds;
     read_timeout.tv_usec = 0;
     setsockopt(origin_fd, SOL_SOCKET, SO_RCVTIMEO, &read_timeout, sizeof(read_timeout));
 
@@ -278,6 +291,12 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats)
     }
 
     if (n < 0 && result == FETCH_OK) {
+        /* SO_RCVTIMEO expiry shows up as EAGAIN/EWOULDBLOCK: the origin went silent. */
+        result = (errno == EAGAIN || errno == EWOULDBLOCK) ? FETCH_ERR_TIMEOUT : FETCH_ERR_RECV;
+    }
+    /* An origin that accepts the connection and closes it without sending a single byte
+     * is a failed fetch, not an empty success. */
+    if (n == 0 && result == FETCH_OK && stats != NULL && stats->bytes_relayed == 0) {
         result = FETCH_ERR_RECV;
     }
 

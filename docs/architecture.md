@@ -72,6 +72,7 @@ To keep initial parsing, validation, and memory boundaries deterministic before 
 ```
 Both Unix line endings (`\n` / LF) and Windows/network line endings (`\r\n` / CRLF) are accepted as valid terminators. The newline character is stripped before parsing.
 - **Connection Lifecycle:** Non-persistent (one request per connection in Phase 1). The client initiates the TCP handshake, sends the single URL line, receives the streamed HTTP response from the proxy, and the proxy closes the client socket immediately upon completion.
+- **Forbidden bytes:** a NUL (zero) byte anywhere in the line is rejected with `400` immediately, so the validated text is always exactly what the client sent.
 - **Trust Assumption:** The client is completely untrusted. Any data arriving before the newline terminator is treated as untrusted input and must not be parsed until line framing is complete.
 
 ---
