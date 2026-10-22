@@ -15,6 +15,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -187,7 +188,11 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats)
     if (stats != NULL) {
         stats->bytes_relayed = 0;
         stats->origin_status = 0;
+        stats->capture = NULL;
+        stats->capture_len = 0;
+        stats->capture_overflow = 0;
     }
+    size_t capture_cap = 0;
 
     int origin_fd = -1;
     FetchStatus conn = origin_connect(url->host, url->port, &origin_fd);
@@ -234,6 +239,41 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats)
         }
         if (stats != NULL) {
             stats->bytes_relayed += (unsigned long long)n;
+
+            /* Keep a bounded copy for the cache. Streaming to the client is never delayed or
+             * limited by this: once the copy would exceed the limit it is simply dropped. */
+            if (stats->capture_limit > 0 && !stats->capture_overflow) {
+                if (stats->capture_len + (size_t)n > stats->capture_limit) {
+                    free(stats->capture);
+                    stats->capture = NULL;
+                    stats->capture_len = 0;
+                    stats->capture_overflow = 1;
+                } else {
+                    if (stats->capture_len + (size_t)n > capture_cap) {
+                        size_t want = capture_cap == 0 ? 16384 : capture_cap * 2;
+                        while (want < stats->capture_len + (size_t)n) {
+                            want *= 2;
+                        }
+                        if (want > stats->capture_limit) {
+                            want = stats->capture_limit;
+                        }
+                        unsigned char *grown = realloc(stats->capture, want);
+                        if (grown == NULL) {
+                            free(stats->capture);
+                            stats->capture = NULL;
+                            stats->capture_len = 0;
+                            stats->capture_overflow = 1;
+                        } else {
+                            stats->capture = grown;
+                            capture_cap = want;
+                        }
+                    }
+                    if (stats->capture != NULL) {
+                        memcpy(stats->capture + stats->capture_len, chunk, (size_t)n);
+                        stats->capture_len += (size_t)n;
+                    }
+                }
+            }
         }
     }
 
@@ -242,5 +282,10 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats)
     }
 
     close(origin_fd);
+    if (result != FETCH_OK && stats != NULL) { /* never hand a partial response to the cache */
+        free(stats->capture);
+        stats->capture = NULL;
+        stats->capture_len = 0;
+    }
     return result;
 }

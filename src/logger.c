@@ -132,6 +132,29 @@ static void sanitize_decision(const char *in, char *out, size_t out_len) {
 
 void log_request(unsigned long request_id, const char *host, const char *decision, int status,
                  unsigned long long bytes_forwarded, long duration_ms) {
+    log_request_ex(request_id, host, decision, status, bytes_forwarded, duration_ms, NULL);
+}
+
+/* Keeps only [a-z0-9_=,.-] and single spaces; everything else becomes '_'. */
+static void sanitize_extras(const char *in, char *out, size_t out_len) {
+    size_t o = 0;
+    if (in != NULL) {
+        for (size_t i = 0; in[i] != '\0' && o + 1 < out_len; i++) {
+            unsigned char c = (unsigned char)in[i];
+            if (isalnum(c)) {
+                out[o++] = (char)tolower(c);
+            } else if (c == '_' || c == '=' || c == ',' || c == '.' || c == '-' || c == ' ') {
+                out[o++] = (char)c;
+            } else {
+                out[o++] = '_';
+            }
+        }
+    }
+    out[o] = '\0';
+}
+
+void log_request_ex(unsigned long request_id, const char *host, const char *decision, int status,
+                    unsigned long long bytes_forwarded, long duration_ms, const char *extras) {
     /* Cheap early exit when logging is disabled; re-checked under the lock below. */
     if (!logger_is_enabled()) {
         return;
@@ -151,11 +174,14 @@ void log_request(unsigned long request_id, const char *host, const char *decisio
     }
 
     /* Build the complete line first so it can go out in ONE write(). */
+    char safe_extras[96];
+    sanitize_extras(extras, safe_extras, sizeof(safe_extras));
+
     char line[LOG_LINE_MAX];
     int len = snprintf(line, sizeof(line),
-                       "%s req=%lu host=%s decision=%s status=%d bytes=%llu duration_ms=%ld\n",
+                       "%s req=%lu host=%s decision=%s status=%d bytes=%llu duration_ms=%ld%s%s\n",
                        timestamp, request_id, safe_host, safe_decision, status, bytes_forwarded,
-                       duration_ms);
+                       duration_ms, safe_extras[0] != '\0' ? " " : "", safe_extras);
     if (len < 0) {
         return;
     }

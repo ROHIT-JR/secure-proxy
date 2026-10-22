@@ -16,6 +16,15 @@ typedef enum {
 typedef struct {
     unsigned long long bytes_relayed; /* origin bytes successfully written to out_fd */
     int origin_status;                /* HTTP status code from the origin's status line, 0 if unknown */
+
+    /* Optional response capture, used by the cache. Set capture_limit (bytes) BEFORE the call
+     * to ask for it. On return, `capture` points to a malloc()'d copy of the complete response
+     * the origin sent (the caller must free() it), or is NULL if capture was not requested, the
+     * fetch failed, or the response exceeded capture_limit (capture_overflow is then 1). */
+    size_t capture_limit;
+    unsigned char *capture;
+    size_t capture_len;
+    int capture_overflow;
 } FetchStats;
 
 /*

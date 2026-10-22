@@ -37,6 +37,7 @@ Each request produces exactly one line of space-separated `key=value` fields (ea
 | `status` | The HTTP (Hypertext Transfer Protocol) status code: the origin's status when a page was forwarded, or the proxy's own error code. `0` means "no response was sent". |
 | `bytes` | Bytes of origin response forwarded to the client. Always `0` for errors the proxy generates itself. |
 | `duration_ms` | Time spent handling the request, in milliseconds. |
+| *extras* (optional) | Extra `key=value` fields after `duration_ms`. Today only `cache=hit\|stored\|miss\|bypass`, see [`cache.md`](cache.md). Extras are always fixed tokens chosen by the proxy, never client data. |
 
 ### Decision values
 

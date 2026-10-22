@@ -33,7 +33,7 @@ ORIGIN_PORT = 9195
 #   2026-10-17T10:00:00Z req=7 host=example.com decision=allowed status=200 bytes=1256 duration_ms=12
 LOG_LINE_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z req=\d+ host=\S+ decision=[a-z0-9_-]+ "
-    r"status=\d+ bytes=\d+ duration_ms=-?\d+$"
+    r"status=\d+ bytes=\d+ duration_ms=-?\d+( [a-z0-9_=,.-]+)*$"
 )
 
 failures = []
@@ -73,6 +73,23 @@ def proxy_fd_count(pid):
 
 
 origin_hits = {"count": 0}  # how many requests the local origin has actually received
+origin_path_hits = {}       # ...per path (query string removed)
+_origin_lock = threading.Lock()
+
+# Controllable origin endpoints for the cache tests: path -> (status, extra headers, body)
+BIG_BODY = b"B" * 300000  # larger than the 256 KiB per-entry cache limit
+CACHE_ENDPOINTS = {
+    "/c/plain": (200, {}, b"plain-body"),
+    "/c/cookie": (200, {"Set-Cookie": "sid=abc123"}, b"cookie-body"),
+    "/c/auth": (200, {"Authorization": "Basic Zm9vOmJhcg=="}, b"auth-body"),
+    "/c/private": (200, {"Cache-Control": "private"}, b"private-body"),
+    "/c/nostore": (200, {"Cache-Control": "no-store"}, b"nostore-body"),
+    "/c/maxage1": (200, {"Cache-Control": "public, max-age=1"}, b"maxage1-body"),
+    "/c/notfound": (404, {}, b"missing"),
+    "/c/big": (200, {}, BIG_BODY),
+    "/c/concurrent": (200, {"Cache-Control": "public, max-age=30"}, b"concurrent-body"),
+    "/c/disabled": (200, {}, b"disabled-body"),
+}
 
 
 def start_origin_server():
@@ -83,7 +100,19 @@ def start_origin_server():
             pass  # keep test output focused on our own PASS/FAIL lines
 
         def do_GET(self):
-            origin_hits["count"] += 1
+            path = self.path.split("?", 1)[0]
+            with _origin_lock:
+                origin_hits["count"] += 1
+                origin_path_hits[path] = origin_path_hits.get(path, 0) + 1
+            if path in CACHE_ENDPOINTS:
+                status, headers, body = CACHE_ENDPOINTS[path]
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             super().do_GET()
 
     os.chdir(FIXTURES_DIR)
@@ -453,6 +482,104 @@ def test_ssrf_override_is_loud(tmp_dir):
            "SSRF protection is DISABLED" in err, err[-120:])
 
 
+def fetch_path(path):
+    return send_request(f"http://127.0.0.1:{ORIGIN_PORT}{path}\n")
+
+
+def count_log(log_path, needle):
+    return sum(1 for l in Path(log_path).read_text().splitlines() if needle in l)
+
+
+def test_response_cache(tmp_dir):
+    log_path = Path(tmp_dir) / "cache.log"
+    proc = start_proxy(log_path, tmp_dir=tmp_dir)
+    try:
+        # 1. an eligible request is cached: repeats are served without touching the origin
+        first = fetch_path("/c/plain")
+        second = fetch_path("/c/plain")
+        third = fetch_path("/c/plain")
+        report("repeating an eligible request produces a cache hit (origin contacted once)",
+               origin_path_hits.get("/c/plain") == 1, f"origin saw {origin_path_hits.get('/c/plain')}")
+        report("a cache hit returns byte-for-byte the same response", first == second == third and b"plain-body" in first)
+        time.sleep(0.2)
+        report("the log records cache=stored once, then cache=hit twice",
+               count_log(log_path, "cache=stored") == 1 and count_log(log_path, "cache=hit") == 2,
+               f"stored={count_log(log_path, 'cache=stored')} hit={count_log(log_path, 'cache=hit')}")
+
+        # 2. responses that must NEVER be cached (each fetched twice => origin contacted twice)
+        for path, why in [("/c/cookie", "Set-Cookie"), ("/c/auth", "Authorization"),
+                          ("/c/private", "Cache-Control: private"), ("/c/nostore", "Cache-Control: no-store"),
+                          ("/c/notfound", "404 status")]:
+            fetch_path(path)
+            fetch_path(path)
+            report(f"never cached: {why}", origin_path_hits.get(path) == 2,
+                   f"origin saw {origin_path_hits.get(path)} request(s)")
+
+        # 3. query strings are never cached (and never logged)
+        before = origin_path_hits.get("/c/plain", 0)
+        fetch_path("/c/plain?session=abc&token=secret")
+        fetch_path("/c/plain?session=abc&token=secret")
+        report("URLs with a query string bypass the cache", origin_path_hits.get("/c/plain") == before + 2)
+        time.sleep(0.2)
+        report("cache=bypass is logged without recording the query string",
+               count_log(log_path, "cache=bypass") == 2 and "token" not in log_path.read_text()
+               and "session" not in log_path.read_text())
+
+        # 4. an oversized response is relayed in full but not cached
+        a = fetch_path("/c/big")
+        b = fetch_path("/c/big")
+        report("an oversized response is still delivered completely", len(a) > 300000 and a.endswith(BIG_BODY[-1000:]),
+               f"got {len(a)} bytes")
+        report("an oversized response is not cached", origin_path_hits.get("/c/big") == 2 and a == b)
+
+        # 5. entries expire
+        fetch_path("/c/maxage1")
+        fetch_path("/c/maxage1")
+        hits_before = origin_path_hits.get("/c/maxage1")
+        time.sleep(1.3)
+        fetch_path("/c/maxage1")
+        report("a cached entry is re-fetched after its max-age expires",
+               hits_before == 1 and origin_path_hits.get("/c/maxage1") == 2,
+               f"before={hits_before} after={origin_path_hits.get('/c/maxage1')}")
+
+        # 6. many concurrent identical requests: all correct, cache stays consistent
+        n = 30
+        results = {}
+
+        def worker(i):
+            results[i] = fetch_path("/c/concurrent")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        ok = all(b"concurrent-body" in results[i] and results[i].startswith(b"HTTP/1.0 200") for i in range(n))
+        report(f"{n} concurrent requests for the same URL all get the correct response", ok)
+        seen = origin_path_hits.get("/c/concurrent")
+        fetch_path("/c/concurrent")
+        report("after the burst the entry is cached (next request is a hit)",
+               origin_path_hits.get("/c/concurrent") == seen, f"origin {seen} -> {origin_path_hits.get('/c/concurrent')}")
+        time.sleep(0.3)
+        lines = Path(log_path).read_text().splitlines()
+        report("every log line is still well formed after the cache burst",
+               all(LOG_LINE_RE.match(l) for l in lines), [l for l in lines if not LOG_LINE_RE.match(l)][:2])
+    finally:
+        stop_proxy(proc)
+
+    # 7. the cache can be switched off
+    log2 = Path(tmp_dir) / "nocache.log"
+    proc = start_proxy(log2, {"PROXY_CACHE": "0"}, tmp_dir)
+    try:
+        fetch_path("/c/disabled")
+        fetch_path("/c/disabled")
+        time.sleep(0.2)
+        report("PROXY_CACHE=0 disables caching (origin contacted every time, no cache field logged)",
+               origin_path_hits.get("/c/disabled") == 2 and "cache=" not in log2.read_text())
+    finally:
+        stop_proxy(proc)
+
+
 def test_policy_startup_errors(tmp_dir):
     env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
                PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
@@ -486,6 +613,7 @@ def main():
         test_policy_blocklist(tmp_dir)
         test_policy_allowlist(tmp_dir)
         test_policy_startup_errors(tmp_dir)
+        test_response_cache(tmp_dir)
         test_ssrf_protection(tmp_dir)
         test_ssrf_override_is_loud(tmp_dir)
     finally:
