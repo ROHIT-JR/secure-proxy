@@ -209,6 +209,7 @@ void policy_free(Policy *p) {
 /* ---------- Network safety: SSRF protection ---------- */
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <stdint.h>
 
 /* `ip` is in host byte order. */
@@ -333,6 +334,20 @@ int hostname_is_local_name(const char *host) {
         if (n > sl && strcmp(norm + (n - sl), suffixes[i]) == 0) {
             return 1;
         }
+    }
+    return 0;
+}
+
+int host_is_numeric_address(const char *host) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV; /* guarantees no DNS query */
+    int rc = getaddrinfo(host, "80", &hints, &res);
+    if (rc == 0) {
+        freeaddrinfo(res);
+        return 1;
     }
     return 0;
 }

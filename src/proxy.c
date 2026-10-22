@@ -19,6 +19,7 @@
 #include "logger.h"
 #include "origin_client.h"
 #include "policy.h"
+#include "reputation.h"
 #include "request_parser.h"
 #include "util.h"
 
@@ -43,6 +44,23 @@ typedef struct {
 
 /* Allowlist/blocklist rules: loaded once at startup, then only read by worker threads. */
 static Policy g_policy;
+
+/* Optional extra "key=value" fields for the request log line. Only fixed tokens go in. */
+typedef struct {
+    char text[96];
+} LogExtras;
+
+static void extras_add(LogExtras *e, const char *token) {
+    size_t used = strlen(e->text);
+    size_t need = strlen(token) + (used > 0 ? 1 : 0);
+    if (used + need + 1 > sizeof(e->text)) {
+        return; /* never truncate a token in half */
+    }
+    if (used > 0) {
+        e->text[used++] = ' ';
+    }
+    memcpy(e->text + used, token, strlen(token) + 1);
+}
 
 static unsigned g_connect_port = CONNECT_DEFAULT_PORT;
 static int g_tunnel_idle_seconds = TUNNEL_DEFAULT_IDLE_SECONDS;
@@ -190,11 +208,32 @@ static void drain_and_close(int client_fd) {
 /* The single decision point for "may we talk to this destination at all?", shared by
  * plain HTTP requests and CONNECT tunnels so both obey exactly the same rules.
  * Returns 1 to proceed. On refusal it sets the log decision/status and returns 0. */
-static int destination_allowed(const char *host, const char **decision, int *status) {
+static int destination_allowed(const char *host, const char **decision, int *status, LogExtras *extras) {
     if (policy_check_host(&g_policy, host) != POLICY_ALLOW) {
         *decision = "blocked_policy";
         *status = 403;
         return 0;
+    }
+
+    /* Reputation: ask only about real hostnames. IP addresses and local names are never sent
+     * to a provider (there is nothing useful to learn, and they are handled by the network-safety
+     * checks). Only the bare hostname leaves this function. */
+    if (reputation_is_enabled() && !hostname_is_local_name(host) && !host_is_numeric_address(host)) {
+        ReputationResult r = reputation_check(host);
+        char token[48];
+        snprintf(token, sizeof(token), "rep=%s", reputation_verdict_name(r.verdict));
+        extras_add(extras, token);
+        if (r.verdict == REP_UNAVAILABLE) {
+            /* An observable event, NOT an assumption that the host is malicious: the request
+             * continues, and the reason is logged so an outage is visible. */
+            snprintf(token, sizeof(token), "rep_reason=%s", reputation_reason_name(r.reason));
+            extras_add(extras, token);
+        }
+        if (r.verdict == REP_MALICIOUS) {
+            *decision = "blocked_reputation";
+            *status = 403;
+            return 0;
+        }
     }
     return 1;
 }
@@ -297,7 +336,7 @@ typedef struct {
 
 /* Handles one CONNECT request end to end. `line` has its CR/LF removed. The caller closes
  * client_fd. HTTPS is only ever tunnelled: no TLS termination, no certificates, no inspection. */
-static void handle_connect(int client_fd, const char *line, ConnectOutcome *out) {
+static void handle_connect(int client_fd, const char *line, ConnectOutcome *out, LogExtras *extras) {
     snprintf(out->host, sizeof(out->host), "-");
     out->decision = "bad_request";
     out->status = 400;
@@ -339,7 +378,7 @@ static void handle_connect(int client_fd, const char *line, ConnectOutcome *out)
         return;
     }
 
-    if (!destination_allowed(target.host, &out->decision, &out->status)) {
+    if (!destination_allowed(target.host, &out->decision, &out->status, extras)) {
         send_error_response(client_fd, 403, "Forbidden", "403 Forbidden: Destination blocked by policy.\n");
         return;
     }
@@ -408,7 +447,9 @@ static void *handle_client(void *arg) {
     const char *log_decision = "client_closed";
     int log_status = 0;
     unsigned long long log_bytes = 0;
-    const char *log_extras = NULL;
+    LogExtras extras;
+    memset(&extras, 0, sizeof(extras));
+    const char *cache_state = NULL; /* "cache=hit|miss|stored|bypass", added to the log once at the end */
     FetchStats stats;
     memset(&stats, 0, sizeof(stats));
     ConnectOutcome connect_outcome; /* function scope: log_host may point into it until cleanup */
@@ -449,12 +490,12 @@ static void *handle_client(void *arg) {
     }
 
     if (request_is_connect(line)) {
-        handle_connect(client_fd, line, &connect_outcome);
+        extras_add(&extras, "method=connect");
+        handle_connect(client_fd, line, &connect_outcome, &extras);
         log_host = connect_outcome.host;
         log_decision = connect_outcome.decision;
         log_status = connect_outcome.status;
         log_bytes = connect_outcome.bytes;
-        log_extras = "method=connect";
         goto cleanup;
     }
 
@@ -474,7 +515,7 @@ static void *handle_client(void *arg) {
 
     /* Policy is applied BEFORE any DNS lookup or outbound connection, so a
      * blocked destination is never even resolved. */
-    if (!destination_allowed(parsed.host, &log_decision, &log_status)) {
+    if (!destination_allowed(parsed.host, &log_decision, &log_status, &extras)) {
         send_error_response(client_fd, 403, "Forbidden",
                             "403 Forbidden: Destination blocked by policy.\n");
         goto cleanup;
@@ -486,7 +527,7 @@ static void *handle_client(void *arg) {
     if (cache_is_enabled()) {
         if (strchr(parsed.path, '?') != NULL || cache_make_key(cache_key, sizeof(cache_key), parsed.host,
                                                                parsed.port, parsed.path) != 0) {
-            log_extras = "cache=bypass";
+            cache_state = "cache=bypass";
         } else {
             cache_usable = 1;
             size_t hit_len = 0;
@@ -498,10 +539,10 @@ static void *handle_client(void *arg) {
                 log_decision = "allowed";
                 log_status = 200;
                 log_bytes = hit_len;
-                log_extras = "cache=hit";
+                cache_state = "cache=hit";
                 goto cleanup;
             }
-            log_extras = "cache=miss";
+            cache_state = "cache=miss";
             stats.capture_limit = CACHE_DEFAULT_MAX_ENTRY_BYTES;
         }
     }
@@ -513,7 +554,7 @@ static void *handle_client(void *arg) {
         CacheVerdict verdict = cache_evaluate_response(stats.capture, stats.capture_len);
         if (verdict.cacheable &&
             cache_store(cache_key, stats.capture, stats.capture_len, verdict.ttl_seconds) == 0) {
-            log_extras = "cache=stored";
+            cache_state = "cache=stored";
         }
     }
     free(stats.capture); /* the single owner of the captured copy (cache_store made its own) */
@@ -552,7 +593,10 @@ cleanup:;
                        (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000L;
     /* Logged before drain_and_close() so the duration excludes the drain delay. */
     free(stats.capture); /* NULL on every path except an early exit after a capture started */
-    log_request_ex(request_id, log_host, log_decision, log_status, log_bytes, duration_ms, log_extras);
+    if (cache_state != NULL) {
+        extras_add(&extras, cache_state);
+    }
+    log_request_ex(request_id, log_host, log_decision, log_status, log_bytes, duration_ms, extras.text);
 
     drain_and_close(client_fd);
 
@@ -639,6 +683,42 @@ int main(void) {
     }
     printf("proxy: CONNECT tunnelling allowed to port %u only\n", g_connect_port);
 
+    /* Reputation: OFF unless an offline fixture file is configured (the default test mode).
+     * A configured but unreadable file is a hard error, like the policy files. */
+    static ReputationProvider rep_provider;
+    const char *rep_fixture = getenv("PROXY_REPUTATION_FIXTURE");
+    if (rep_fixture != NULL && rep_fixture[0] != '\0') {
+        unsigned rep_timeout = 1500, rep_ttl = 300;
+        const char *e = getenv("PROXY_REPUTATION_TIMEOUT_MS");
+        if (e != NULL && e[0] != '\0') {
+            char *endp = NULL;
+            long v = strtol(e, &endp, 10);
+            if (*endp != '\0' || v < 50 || v > 30000) {
+                fprintf(stderr, "proxy: error: PROXY_REPUTATION_TIMEOUT_MS must be 50-30000\n");
+                return EXIT_FAILURE;
+            }
+            rep_timeout = (unsigned)v;
+        }
+        e = getenv("PROXY_REPUTATION_TTL_SECONDS");
+        if (e != NULL && e[0] != '\0') {
+            char *endp = NULL;
+            long v = strtol(e, &endp, 10);
+            if (*endp != '\0' || v < 1 || v > 86400) {
+                fprintf(stderr, "proxy: error: PROXY_REPUTATION_TTL_SECONDS must be 1-86400\n");
+                return EXIT_FAILURE;
+            }
+            rep_ttl = (unsigned)v;
+        }
+        size_t rep_bad = 0;
+        if (reputation_fixture_load(rep_fixture, getenv("PROXY_REPUTATION_QUERY_LOG"), &rep_provider, &rep_bad) != 0 ||
+            reputation_init(&rep_provider, rep_timeout, rep_ttl) != 0) {
+            fprintf(stderr, "proxy: error: cannot load the reputation fixture file; refusing to start\n");
+            return EXIT_FAILURE;
+        }
+        printf("proxy: reputation checks ON (offline fixture provider, timeout %u ms, %zu malformed line(s) ignored)\n",
+               rep_timeout, rep_bad);
+    }
+
     const char *cache_env = getenv("PROXY_CACHE");
     if (cache_env != NULL && strcmp(cache_env, "0") == 0) {
         printf("proxy: response cache disabled (PROXY_CACHE=0)\n");
@@ -703,6 +783,7 @@ int main(void) {
     }
 
     close(listen_fd);
+    reputation_shutdown();
     cache_destroy();
     policy_free(&g_policy);
     return 0;

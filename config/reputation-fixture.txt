@@ -1,0 +1,25 @@
+# reputation-fixture.txt -- OFFLINE threat-reputation answers for tests and demos.
+#
+# Nothing here talks to the internet. The proxy only reads this file when you start it with:
+#
+#   PROXY_REPUTATION_FIXTURE=config/reputation-fixture.txt ./bin/proxy
+#
+# Format: "<host> <verdict>", one per line, '#' starts a comment.
+#   verdict: safe | suspicious | malicious | unavailable | timeout
+#   A host starting with '.' also covers every subdomain (".bad-zone.invalid").
+#   Hosts that are not listed are treated as "safe".
+#
+#   malicious    -> the request is refused (403, decision=blocked_reputation)
+#   suspicious   -> allowed, but logged as rep=suspicious
+#   safe         -> allowed
+#   unavailable  -> the provider "failed": allowed, logged as rep=unavailable (NOT treated as malicious)
+#   timeout      -> the provider answers far too late: the proxy gives up after its timeout,
+#                   allows the request, and logs rep=unavailable rep_reason=timeout
+#
+# All names below end in ".invalid", a TLD reserved by RFC 2606, so they can never be real sites.
+malicious-fixture.invalid   malicious
+.bad-zone.invalid           malicious
+suspicious-fixture.invalid  suspicious
+safe-fixture.invalid        safe
+down-fixture.invalid        unavailable
+slow-fixture.invalid        timeout
