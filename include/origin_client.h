@@ -8,7 +8,8 @@ typedef enum {
     FETCH_ERR_DNS,
     FETCH_ERR_CONNECT,
     FETCH_ERR_SEND,
-    FETCH_ERR_RECV
+    FETCH_ERR_RECV,
+    FETCH_ERR_UNSAFE_ADDRESS /* destination is (or resolves to) a loopback/private/link-local/... address */
 } FetchStatus;
 
 /* Optional facts about a fetch, filled in by fetch_and_relay() for logging. */
@@ -39,3 +40,29 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats)
 
 /* Returns a human-readable description of a FetchStatus code. */
 const char *fetch_status_to_string(FetchStatus status);
+
+/*
+ * Resolves `host` and opens a TCP connection to it, enforcing network safety:
+ *   - "localhost" and ".localhost"/".local" names are refused with no lookup;
+ *   - numeric forms (127.0.0.1, 2130706433, 0x7f.1, ...) are parsed WITHOUT any
+ *     DNS query, then checked;
+ *   - after DNS, EVERY returned address must be safe, otherwise the whole
+ *     destination is refused (a mix of public and private answers is a classic
+ *     DNS-rebinding trick);
+ *   - each address is checked again immediately before connect(), and the
+ *     address actually connected to is checked once more.
+ * The name is resolved exactly once and the checked address is the one used,
+ * so there is no second lookup an attacker could answer differently.
+ *
+ * On FETCH_OK, *out_fd is a connected, blocking socket owned by the caller.
+ * Possible failures: FETCH_ERR_DNS, FETCH_ERR_UNSAFE_ADDRESS, FETCH_ERR_CONNECT.
+ */
+FetchStatus origin_connect(const char *host, unsigned port, int *out_fd);
+
+/*
+ * TESTING ONLY. When set to 1, loopback/private destinations are allowed so the
+ * automated tests can use a local origin server. Must be called (if at all)
+ * before any worker thread starts. The proxy only enables it when the operator
+ * sets PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1, and then prints a loud warning.
+ */
+void origin_client_set_allow_private(int allow);

@@ -11,7 +11,7 @@ Every acronym is spelled out on first use.
 The following sections will be completed once the corresponding issue is implemented. Placeholders are listed so the full five-minute demo script (Issue 18) has a fixed shape to fill in:
 
 - Blocklist rejection (Issue 10) — *implemented; see [`docs/policy.md`](policy.md)*
-- Private-network rejection / SSRF (Server-Side Request Forgery) protection (Issue 11) — *pending*
+- Private-network rejection / SSRF (Server-Side Request Forgery) protection (Issue 11) — *implemented; see the allowed-network policy in [`threat-model.md`](threat-model.md)*
 - Cache hit (Issue 12) — *pending*
 - Safe logs with no leaked secrets (Issue 9) — *implemented; see [`docs/logging.md`](logging.md) for the format, privacy guarantees, and a copy-paste demo*
 - Optional: HTTPS (Hypertext Transfer Protocol Secure) `CONNECT` tunnelling (Issue 13) — *pending*

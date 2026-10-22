@@ -272,7 +272,13 @@ static void *handle_client(void *arg) {
      * FETCH_ERR_RECV mean the client may already have a partial raw
      * response on the wire; sending another response on top of that
      * would corrupt the stream, so we just stop. */
-    if (fetch_status == FETCH_ERR_DNS || fetch_status == FETCH_ERR_CONNECT) {
+    if (fetch_status == FETCH_ERR_UNSAFE_ADDRESS) {
+        /* Deliberately generic: never reveal which address a name resolved to. */
+        send_error_response(client_fd, 403, "Forbidden",
+                            "403 Forbidden: Destination address is not permitted.\n");
+        log_decision = "blocked_private";
+        log_status = 403;
+    } else if (fetch_status == FETCH_ERR_DNS || fetch_status == FETCH_ERR_CONNECT) {
         char body[256];
         snprintf(body, sizeof(body), "502 Bad Gateway: %s\n", fetch_status_to_string(fetch_status));
         send_error_response(client_fd, 502, "Bad Gateway", body);
@@ -347,6 +353,15 @@ int main(void) {
     }
     printf("proxy: policy loaded: %zu block rule(s), %zu allow rule(s), allowlist mode %s\n",
            g_policy.block_count, g_policy.allow_count, g_policy.allowlist_active ? "ON" : "off");
+
+    /* TESTING ONLY: lets the automated tests use a loopback origin server. Off by default;
+     * when on, every request to loopback/private networks is allowed, so say so loudly. */
+    const char *allow_private = getenv("PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS");
+    if (allow_private != NULL && strcmp(allow_private, "1") == 0) {
+        origin_client_set_allow_private(1);
+        fprintf(stderr, "proxy: WARNING: PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1 -- SSRF protection is "
+                        "DISABLED. Use only for local testing.\n");
+    }
 
     int listen_fd = create_listening_socket();
     printf("proxy: listening on port %d\n", LISTEN_PORT);

@@ -27,11 +27,44 @@ This document describes what SecureBrowse protects, who it protects against, how
 ## Safety controls in place
 
 - Allowlist/blocklist policy checks happen **before** DNS resolution or any outbound connection (Issue 10; see `docs/policy.md`). Allowlists fail closed, and a policy file the operator explicitly configured but that cannot be read stops the proxy from starting.
-- Resolved addresses are checked against loopback, private (RFC 1918), link-local, multicast, and unspecified ranges for both IPv4 and IPv6, and re-checked at connection time to reduce DNS-rebinding risk (Issue 11).
+- Every destination address is checked against the allowed-network policy below, both when a name is resolved and again immediately before (and just after) connecting. Names are resolved exactly once and the checked address is the one used, which defeats DNS rebinding by construction (Issue 11; see "Allowed-network policy").
 - Logs record only the validated hostname — never credentials, query strings, fragments, paths, or the raw request line — are written with owner-only permissions, and cannot be interleaved or forged by hostile input (Issue 9; see `docs/logging.md`).
 - The cache never stores responses containing `Set-Cookie`, `Authorization`, or unapproved cache-control directives (Issue 12).
 - The reputation provider only ever receives the normalised hostname, never full URLs, credentials, or request bodies (Issue 14).
 - Every request has a maximum size and a connection timeout, so a slow or oversized client cannot tie up a worker thread indefinitely.
+
+## Allowed-network policy
+
+The proxy connects **only to public, globally routable addresses**. The check runs on the *address*, not the name, so it cannot be dodged by choosing a clever hostname.
+
+| Refused | Examples | Why |
+| --- | --- | --- |
+| Loopback | `127.0.0.0/8`, `::1` | Would let a client reach services bound to the proxy host itself. |
+| Private (RFC 1918) and unique-local | `10/8`, `172.16/12`, `192.168/16`, `fc00::/7` | Internal networks behind the proxy. |
+| Link-local | `169.254/16` (**includes the cloud metadata address `169.254.169.254`**), `fe80::/10` | Cloud instance metadata can hand out credentials. |
+| Unspecified / "this network" | `0.0.0.0/8`, `::` | Many systems treat these as "this machine". |
+| Carrier-grade NAT, benchmarking, documentation, reserved, broadcast | `100.64/10`, `198.18/15`, `192.0.2/24`, `240/4` | Not valid public destinations. |
+| Multicast | `224/4`, `ff00::/8` | Not a unicast destination. |
+| IPv6 forms that *contain* an IPv4 address | `::ffff:127.0.0.1` (mapped), `64:ff9b::7f00:1` (NAT64), `2002:7f00:1::` (6to4), `::127.0.0.1`, Teredo | The embedded IPv4 address is judged by the same rules. |
+| Local names (refused with **no DNS lookup**) | `localhost`, `*.localhost`, `*.local` | Never meant to leave the machine. |
+| Any unknown or malformed address | | Fail closed. |
+
+### How the checks are layered
+
+1. **Names:** `localhost`-style names are refused before any lookup.
+2. **Numeric spellings:** the host is first parsed with `AI_NUMERICHOST`, which *never* queries DNS. This catches every spelling the system resolver accepts for the same address: `127.0.0.1`, `2130706433` (decimal), `0x7f.1` (hex), `017700000001` (octal) and `127.1` all resolve to loopback and are refused. These are classic SSRF filter bypasses, and the unit tests resolve each one through the real resolver to prove it.
+3. **After DNS:** if the name is not numeric it is resolved once, and **every** returned address must be safe. If even one is not, the whole destination is refused. A mix of public and private answers is a known rebinding trick.
+4. **At connection time:** each address is checked again immediately before `connect()`, and the peer actually reached is checked again afterwards.
+
+Because step 3 resolves once and step 4 connects to *that same checked address*, there is no second lookup that an attacker's DNS server could answer differently ("DNS rebinding").
+
+The client only ever sees `403 Forbidden: Destination address is not permitted.` It never learns which address a name resolved to. Refusals are logged as `decision=blocked_private`.
+
+### Operator notes and limits
+
+- **Testing override:** `PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1` turns all of the above off so the automated tests can use a loopback origin server. It is off by default and prints a loud warning when enabled. Never set it on a real deployment.
+- **Not simulated end to end:** the tests prove the address rules, the numeric-spelling bypasses and that no TCP connection is made to forbidden addresses. They do not stand up a malicious DNS server to flip answers between lookups; the rebinding defence is structural (single resolution, checked address reused) rather than demonstrated against a live attacker.
+- **IPv6 literals in URLs** (`http://[::1]/`) are already rejected by the URL parser as invalid hosts; the IPv6 rules apply to AAAA records returned by DNS.
 
 ## Explicit non-goals
 
