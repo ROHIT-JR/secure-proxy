@@ -72,12 +72,19 @@ def proxy_fd_count(pid):
     return len(os.listdir(f"/proc/{pid}/fd"))
 
 
+origin_hits = {"count": 0}  # how many requests the local origin has actually received
+
+
 def start_origin_server():
     handler = http.server.SimpleHTTPRequestHandler
 
     class QuietHandler(handler):
         def log_message(self, *args):
             pass  # keep test output focused on our own PASS/FAIL lines
+
+        def do_GET(self):
+            origin_hits["count"] += 1
+            super().do_GET()
 
     os.chdir(FIXTURES_DIR)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", ORIGIN_PORT), QuietHandler)
@@ -86,8 +93,19 @@ def start_origin_server():
     return httpd
 
 
-def start_proxy(log_path):
+def write_rules(tmp_dir, name, text):
+    path = Path(tmp_dir) / name
+    path.write_text(text)
+    return path
+
+
+def start_proxy(log_path, extra_env=None, tmp_dir=None):
+    # Always pin both policy files so a test never depends on the working directory.
     env = dict(os.environ, PROXY_LOG_FILE=str(log_path))
+    if tmp_dir is not None:
+        env.setdefault("PROXY_ALLOWLIST", str(write_rules(tmp_dir, "empty_allow.txt", "# off\n")))
+        env.setdefault("PROXY_BLOCKLIST", str(write_rules(tmp_dir, "empty_block.txt", "# none\n")))
+    env.update(extra_env or {})
     proc = subprocess.Popen(
         [str(PROXY_BIN)],
         stdout=subprocess.DEVNULL,
@@ -250,7 +268,7 @@ def test_logging_failures_do_not_stop_proxy(tmp_dir):
     if os.access("/dev/full", os.W_OK):
         scenarios.append(("log writes failing (/dev/full)", "/dev/full"))
     for label, path in scenarios:
-        proc = start_proxy(path)
+        proc = start_proxy(path, tmp_dir=tmp_dir)
         try:
             resp = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
             bad = send_request("not-a-url\n")
@@ -261,6 +279,82 @@ def test_logging_failures_do_not_stop_proxy(tmp_dir):
             stop_proxy(proc)
 
 
+def test_policy_blocklist(tmp_dir):
+    """A blocked host is refused with 403 BEFORE any DNS lookup or connection."""
+    block = write_rules(tmp_dir, "block.txt",
+                        "127.0.0.1\nblocked-example.test\n.malicious-example.test\n")
+    proc = start_proxy(Path(tmp_dir) / "policy.log",
+                       {"PROXY_BLOCKLIST": str(block)}, tmp_dir)
+    try:
+        before = origin_hits["count"]
+        resp = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+        line = status_line_of(resp)
+        report("blocked host -> 403 Forbidden", line.startswith("HTTP/1.1 403"), line)
+        report("blocked host never reached the origin (no outbound connection)",
+               origin_hits["count"] == before, f"origin saw {origin_hits['count'] - before} request(s)")
+
+        # A name that cannot resolve: if the proxy did DNS first this would be 502, not 403.
+        resp = send_request("http://blocked-example.test/\n")
+        line = status_line_of(resp)
+        report("blocked host is refused before DNS (403, not a 502 DNS failure)",
+               line.startswith("HTTP/1.1 403"), line)
+        resp = send_request("http://deep.sub.malicious-example.test/\n")
+        report("subdomain rule blocks any depth below the domain",
+               status_line_of(resp).startswith("HTTP/1.1 403"), status_line_of(resp))
+
+        variants = ["BLOCKED-EXAMPLE.TEST", "Blocked-Example.Test", "blocked-example.test.",
+                    "bLoCkEd-ExAmPlE.tEsT:80"]
+        bad = [v for v in variants
+               if not status_line_of(send_request(f"http://{v}/\n")).startswith("HTTP/1.1 403")]
+        report("case / trailing-dot / port variants cannot bypass a block rule", not bad, f"bypassed: {bad}")
+
+        resp = send_request("http://notblocked-example.test/\n")
+        report("a similar-looking host is not blocked (suffix boundary)",
+               status_line_of(resp).startswith("HTTP/1.1 502"), status_line_of(resp))
+
+        body = resp_body = send_request("http://blocked-example.test/\n").decode(errors="replace")
+        report("403 reason is non-sensitive (no rule text, file paths or config)",
+               "blocked-example" not in body.split("\r\n\r\n", 1)[1] and "block.txt" not in body, body[-120:])
+        time.sleep(0.2)
+        log = Path(tmp_dir, "policy.log").read_text()
+        report("blocked requests are logged as decision=blocked_policy status=403",
+               "decision=blocked_policy status=403" in log)
+    finally:
+        stop_proxy(proc)
+
+
+def test_policy_allowlist(tmp_dir):
+    allow = write_rules(tmp_dir, "allow.txt", "# only the local origin\n127.0.0.1\n")
+    proc = start_proxy(Path(tmp_dir) / "allowmode.log", {"PROXY_ALLOWLIST": str(allow)}, tmp_dir)
+    try:
+        ok = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+        report("allowlist mode: a listed host is served", b"fixture: index page" in ok, status_line_of(ok))
+        before = origin_hits["count"]
+        other = send_request("http://this-host-does-not-exist.invalid/\n")
+        report("allowlist mode: an unlisted host is refused before DNS (403, not 502)",
+               status_line_of(other).startswith("HTTP/1.1 403"), status_line_of(other))
+        report("allowlist mode: refusal made no outbound connection", origin_hits["count"] == before)
+    finally:
+        stop_proxy(proc)
+
+    typo = write_rules(tmp_dir, "typo_allow.txt", "*.example.com\n")
+    proc = start_proxy(Path(tmp_dir) / "typomode.log", {"PROXY_ALLOWLIST": str(typo)}, tmp_dir)
+    try:
+        resp = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+        report("a malformed allowlist fails closed (denies everything, not allow-all)",
+               status_line_of(resp).startswith("HTTP/1.1 403"), status_line_of(resp))
+    finally:
+        stop_proxy(proc)
+
+
+def test_policy_startup_errors(tmp_dir):
+    env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
+               PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
+    proc = subprocess.run([str(PROXY_BIN)], env=env, capture_output=True, timeout=10)
+    report("an explicitly configured but unreadable policy file stops startup (fail closed)",
+           proc.returncode != 0 and b"refusing to start" in proc.stderr, f"rc={proc.returncode}")
+
+
 def main():
     if not PROXY_BIN.exists():
         print(f"error: {PROXY_BIN} does not exist -- run `make` first", file=sys.stderr)
@@ -269,7 +363,7 @@ def main():
     httpd = start_origin_server()
     tmp_dir = tempfile.mkdtemp(prefix="secure-proxy-it-")
     log_path = Path(tmp_dir) / "proxy.log"
-    proxy_proc = start_proxy(log_path)
+    proxy_proc = start_proxy(log_path, tmp_dir=tmp_dir)
 
     try:
         test_success()
@@ -283,6 +377,9 @@ def main():
         test_log_concurrent_lines(log_path)
         stop_proxy(proxy_proc)
         test_logging_failures_do_not_stop_proxy(tmp_dir)
+        test_policy_blocklist(tmp_dir)
+        test_policy_allowlist(tmp_dir)
+        test_policy_startup_errors(tmp_dir)
     finally:
         stop_proxy(proxy_proc)  # no-op if already stopped
         httpd.shutdown()

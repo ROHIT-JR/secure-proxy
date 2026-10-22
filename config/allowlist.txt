@@ -1,7 +1,21 @@
-# allowlist.txt
-# One hostname per line. Lines starting with # are comments. Blank lines are ignored.
-# Hostnames are matched case-insensitively after normalisation.
-# Exact host match:
-example.com
-# A leading dot means "this host and its subdomains" (documented subdomain rule):
-.example.org
+# allowlist.txt -- OPTIONAL "only these destinations" mode.
+#
+# Format: one rule per line. '#' starts a comment (whole line or after a rule).
+# Blank lines are ignored. Rules are case-insensitive.
+#
+#   example.com        exact match: only the host example.com
+#   .example.org       subdomain rule: example.org AND every subdomain of it
+#                      (www.example.org, a.b.example.org, ...), but NOT
+#                      notexample.org
+#
+# IMPORTANT: this file is OFF by default because every example below is a
+# comment. As soon as you add ONE real (uncommented) rule, the proxy switches
+# to allowlist mode and refuses every host that is not listed. The blocklist
+# is always checked first, so a blocked host stays blocked even if listed here.
+#
+# Fail-closed: if this file contains rules but none of them are valid (for
+# example a typo), the proxy stays in allowlist mode and denies everything
+# rather than silently turning the allowlist off.
+#
+# example.com
+# .example.org

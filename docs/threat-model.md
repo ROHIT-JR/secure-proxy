@@ -26,7 +26,7 @@ This document describes what SecureBrowse protects, who it protects against, how
 
 ## Safety controls in place
 
-- Allowlist/blocklist policy checks happen **before** DNS resolution or any outbound connection (Issue 10).
+- Allowlist/blocklist policy checks happen **before** DNS resolution or any outbound connection (Issue 10; see `docs/policy.md`). Allowlists fail closed, and a policy file the operator explicitly configured but that cannot be read stops the proxy from starting.
 - Resolved addresses are checked against loopback, private (RFC 1918), link-local, multicast, and unspecified ranges for both IPv4 and IPv6, and re-checked at connection time to reduce DNS-rebinding risk (Issue 11).
 - Logs record only the validated hostname — never credentials, query strings, fragments, paths, or the raw request line — are written with owner-only permissions, and cannot be interleaved or forged by hostile input (Issue 9; see `docs/logging.md`).
 - The cache never stores responses containing `Set-Cookie`, `Authorization`, or unapproved cache-control directives (Issue 12).

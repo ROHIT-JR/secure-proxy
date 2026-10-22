@@ -1,7 +1,14 @@
-# blocklist.txt
-# One hostname per line. Lines starting with # are comments. Blank lines are ignored.
-# Hostnames are matched case-insensitively after normalisation.
-# Exact host match:
+# blocklist.txt -- destinations the proxy must never contact.
+#
+# Format: one rule per line. '#' starts a comment (whole line or after a rule).
+# Blank lines are ignored. Rules are case-insensitive.
+#
+#   blocked-example.test     exact match: only the host blocked-example.test
+#   .malicious-example.test  subdomain rule: malicious-example.test AND every
+#                            subdomain of it, but NOT notmalicious-example.test
+#
+# A blocked host is rejected with 403 Forbidden BEFORE any DNS lookup or
+# outbound connection is attempted. The .test names below are reserved by
+# RFC 2606 and can never resolve on the real internet, so they are safe examples.
 blocked-example.test
-# A leading dot means "this host and its subdomains" (documented subdomain rule):
 .malicious-example.test
