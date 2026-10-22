@@ -44,7 +44,7 @@ The project is split into two milestones:
 - Integration tests and a repeatable Phase 1 demo.
 
 ### Phase 2 — Security-Aware and More Valuable
-- Privacy-aware structured request logging (no credentials, query strings, or fragments logged).
+- Privacy-aware structured request logging (no credentials, query strings, fragments, or paths logged) — **implemented**, see [`docs/logging.md`](docs/logging.md).
 - Allowlist/blocklist policy engine, checked before any DNS lookup.
 - SSRF (Server-Side Request Forgery) protection: rejects loopback, private, link-local, and other unsafe addresses, re-checked at connect time.
 - Thread-safe bounded response cache with a documented eviction policy.

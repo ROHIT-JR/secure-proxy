@@ -28,7 +28,7 @@ This document describes what SecureBrowse protects, who it protects against, how
 
 - Allowlist/blocklist policy checks happen **before** DNS resolution or any outbound connection (Issue 10).
 - Resolved addresses are checked against loopback, private (RFC 1918), link-local, multicast, and unspecified ranges for both IPv4 and IPv6, and re-checked at connection time to reduce DNS-rebinding risk (Issue 11).
-- Logs strip credentials, query strings, and fragments before writing (Issue 9).
+- Logs record only the validated hostname — never credentials, query strings, fragments, paths, or the raw request line — are written with owner-only permissions, and cannot be interleaved or forged by hostile input (Issue 9; see `docs/logging.md`).
 - The cache never stores responses containing `Set-Cookie`, `Authorization`, or unapproved cache-control directives (Issue 12).
 - The reputation provider only ever receives the normalised hostname, never full URLs, credentials, or request bodies (Issue 14).
 - Every request has a maximum size and a connection timeout, so a slow or oversized client cannot tie up a worker thread indefinitely.

@@ -8,6 +8,7 @@
 #include "origin_client.h"
 #include "util.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -72,7 +73,24 @@ static int connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t a
     return 0;
 }
 
-FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd) {
+/* Extracts the 3-digit status code from an "HTTP/x.y NNN ..." status line, or 0 if absent. */
+static int parse_origin_status(const char *buf, size_t len) {
+    if (len < 12 || memcmp(buf, "HTTP/", 5) != 0 || buf[8] != ' ') {
+        return 0;
+    }
+    if (!isdigit((unsigned char)buf[9]) || !isdigit((unsigned char)buf[10]) ||
+        !isdigit((unsigned char)buf[11])) {
+        return 0;
+    }
+    return (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0');
+}
+
+FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd, FetchStats *stats) {
+    if (stats != NULL) {
+        stats->bytes_relayed = 0;
+        stats->origin_status = 0;
+    }
+
     char port_str[6];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)url->port);
 
@@ -132,10 +150,20 @@ FetchStatus fetch_and_relay(const ParsedUrl *url, int out_fd) {
     ssize_t n;
     FetchStatus result = FETCH_OK;
 
+    int first_chunk = 1;
     while ((n = recv(origin_fd, chunk, sizeof(chunk), 0)) > 0) {
+        if (first_chunk) {
+            first_chunk = 0;
+            if (stats != NULL) {
+                stats->origin_status = parse_origin_status(chunk, (size_t)n);
+            }
+        }
         if (send_all(out_fd, chunk, (size_t)n) < 0) {
             result = FETCH_ERR_SEND;
             break;
+        }
+        if (stats != NULL) {
+            stats->bytes_relayed += (unsigned long long)n;
         }
     }
 

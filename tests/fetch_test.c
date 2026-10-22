@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    FetchStatus fetch_status = fetch_and_relay(&url, out_fd);
+    FetchStatus fetch_status = fetch_and_relay(&url, out_fd, NULL);
     close(out_fd);
 
     if (fetch_status != FETCH_OK) {

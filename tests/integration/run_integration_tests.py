@@ -3,7 +3,9 @@
 against a local-origin test server, covering success, malformed URL, DNS
 failure, oversized input, and multiple concurrent clients. Also checks
 that the proxy's open file descriptor count returns to its baseline after
-every scenario, as evidence that every socket it opens is also closed.
+every scenario, as evidence that every socket it opens is also closed, and
+that the privacy-aware request log is well formed, leak-free and never
+interleaved under concurrent load.
 
 Deliberately uses only local-origin servers -- no real external site is
 ever contacted, per the project's safe-testing rules.
@@ -11,9 +13,11 @@ ever contacted, per the project's safe-testing rules.
 
 import http.server
 import os
+import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,6 +28,13 @@ FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "webroot"
 
 PROXY_PORT = 8080
 ORIGIN_PORT = 9195
+
+# One structured line per request, e.g.:
+#   2026-10-17T10:00:00Z req=7 host=example.com decision=allowed status=200 bytes=1256 duration_ms=12
+LOG_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z req=\d+ host=\S+ decision=[a-z0-9_-]+ "
+    r"status=\d+ bytes=\d+ duration_ms=-?\d+$"
+)
 
 failures = []
 
@@ -75,11 +86,13 @@ def start_origin_server():
     return httpd
 
 
-def start_proxy():
+def start_proxy(log_path):
+    env = dict(os.environ, PROXY_LOG_FILE=str(log_path))
     proc = subprocess.Popen(
         [str(PROXY_BIN)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
     # Wait for the listening socket to actually be ready instead of a fixed sleep guess.
     for _ in range(50):
@@ -170,13 +183,93 @@ def test_no_fd_leak(pid):
     )
 
 
+def stop_proxy(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def read_log(log_path):
+    return Path(log_path).read_text().splitlines()
+
+
+def test_log_line_format(log_path):
+    send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+    time.sleep(0.2)
+    last = [l for l in read_log(log_path) if "host=127.0.0.1" in l]
+    ok = bool(last) and LOG_LINE_RE.match(last[-1]) is not None
+    ok = ok and "decision=allowed status=200" in last[-1]
+    report("log line has timestamp, request id, host, decision, status, bytes, duration", ok,
+           last[-1] if last else "no log line for 127.0.0.1")
+    bytes_logged = int(re.search(r"bytes=(\d+)", last[-1]).group(1)) if last else -1
+    expected = len(send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n"))
+    report("logged bytes equals the bytes actually forwarded", bytes_logged == expected,
+           f"logged={bytes_logged}, actual={expected}")
+
+
+def test_log_privacy(log_path):
+    secret_requests = [
+        f"http://127.0.0.1:{ORIGIN_PORT}/index.html?token=secret\n",   # forwarded
+        "http://admin:hunter2@127.0.0.1:%d/index.html?token=secret\n" % ORIGIN_PORT,  # rejected
+        f"http://127.0.0.1:{ORIGIN_PORT}/index.html#frag-secret\n",      # rejected
+        "this is a garbage line with token=secret and hunter2\n",         # rejected
+    ]
+    for r in secret_requests:
+        send_request(r)
+    time.sleep(0.3)
+    text = Path(log_path).read_text()
+    leaked = [w for w in ("secret", "hunter2", "token", "admin", "frag", "garbage") if w in text]
+    report("?token=secret, credentials, fragments and raw request text never reach the log",
+           not leaked, f"leaked: {leaked}")
+
+
+def test_log_concurrent_lines(log_path, n=40):
+    before = len(read_log(log_path))
+    threads = [threading.Thread(target=send_request,
+                                args=(f"http://127.0.0.1:{ORIGIN_PORT}/page{(i % 5) + 1}.html\n",))
+               for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    time.sleep(0.3)
+    lines = read_log(log_path)
+    bad = [l for l in lines if not LOG_LINE_RE.match(l)]
+    ids = [int(re.search(r"req=(\d+)", l).group(1)) for l in lines if LOG_LINE_RE.match(l)]
+    report(f"{n} concurrent requests -> {n} complete, non-interleaved log lines",
+           len(lines) - before == n and not bad, f"new={len(lines) - before}, malformed={bad[:2]}")
+    report("every request id in the log is unique", len(ids) == len(set(ids)))
+
+
+def test_logging_failures_do_not_stop_proxy(tmp_dir):
+    """A log path that cannot be opened, and one whose writes always fail
+    (/dev/full), must both leave the proxy serving requests normally."""
+    scenarios = [("unopenable log path", str(Path(tmp_dir) / "no-such-dir" / "x.log"))]
+    if os.access("/dev/full", os.W_OK):
+        scenarios.append(("log writes failing (/dev/full)", "/dev/full"))
+    for label, path in scenarios:
+        proc = start_proxy(path)
+        try:
+            resp = send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+            bad = send_request("not-a-url\n")
+            ok = (b"fixture: index page" in resp and status_line_of(bad).startswith("HTTP/1.1 400")
+                  and proc.poll() is None)
+            report(f"proxy keeps serving with {label}", ok, status_line_of(resp))
+        finally:
+            stop_proxy(proc)
+
+
 def main():
     if not PROXY_BIN.exists():
         print(f"error: {PROXY_BIN} does not exist -- run `make` first", file=sys.stderr)
         sys.exit(2)
 
     httpd = start_origin_server()
-    proxy_proc = start_proxy()
+    tmp_dir = tempfile.mkdtemp(prefix="secure-proxy-it-")
+    log_path = Path(tmp_dir) / "proxy.log"
+    proxy_proc = start_proxy(log_path)
 
     try:
         test_success()
@@ -185,12 +278,13 @@ def main():
         test_oversized_input()
         test_concurrent_clients()
         test_no_fd_leak(proxy_proc.pid)
+        test_log_line_format(log_path)
+        test_log_privacy(log_path)
+        test_log_concurrent_lines(log_path)
+        stop_proxy(proxy_proc)
+        test_logging_failures_do_not_stop_proxy(tmp_dir)
     finally:
-        proxy_proc.terminate()
-        try:
-            proxy_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proxy_proc.kill()
+        stop_proxy(proxy_proc)  # no-op if already stopped
         httpd.shutdown()
 
     print()

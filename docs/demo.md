@@ -13,7 +13,7 @@ The following sections will be completed once the corresponding issue is impleme
 - Blocklist rejection (Issue 10) — *pending*
 - Private-network rejection / SSRF (Server-Side Request Forgery) protection (Issue 11) — *pending*
 - Cache hit (Issue 12) — *pending*
-- Safe logs with no leaked secrets (Issue 9) — *pending*
+- Safe logs with no leaked secrets (Issue 9) — *implemented; see [`docs/logging.md`](logging.md) for the format, privacy guarantees, and a copy-paste demo*
 - Optional: HTTPS (Hypertext Transfer Protocol Secure) `CONNECT` tunnelling (Issue 13) — *pending*
 - Optional: offline reputation result (Issue 14) — *pending*
 
