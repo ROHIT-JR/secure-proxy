@@ -50,7 +50,7 @@ The project is split into two milestones:
 - Thread-safe bounded response cache (LRU eviction) that never caches cookies, credentials, or query-string URLs — **implemented**, see [`docs/cache.md`](docs/cache.md).
 - HTTPS `CONNECT` tunnelling with byte relay only — no interception, no decryption — **implemented**, see [`docs/https-tunnelling.md`](docs/https-tunnelling.md).
 - Pluggable `ReputationProvider` interface with an offline fixture provider for deterministic tests (**implemented**, see [`docs/reputation.md`](docs/reputation.md)), and an optional live threat-feed adapter (not yet built).
-- Explainable risk scoring with a safe, non-sensitive decision page.
+- Explainable risk scoring with a safe, non-sensitive decision page — **implemented**, see [`docs/risk-scoring.md`](docs/risk-scoring.md).
 
 ## Quick start
 

@@ -1003,6 +1003,113 @@ def test_reputation(tmp_dir):
            res.returncode != 0 and b"refusing to start" in res.stderr, f"rc={res.returncode}")
 
 
+def split_response(raw):
+    head, _, body = raw.partition(b"\r\n\r\n")
+    return head.decode(errors="replace"), body.decode(errors="replace")
+
+
+def test_decision_pages(tmp_dir):
+    """Every kind of block gives a distinguishable HTML page with the request ID and a SAFE reason;
+    the technical detail (rule, address, provider answer, risk score) stays in the server log."""
+    block = write_rules(tmp_dir, "dp_block.txt", "blocked-page.invalid\n")
+    fixture = write_rules(tmp_dir, "dp_rep.txt", "malicious-page.invalid malicious\n"
+                          "suspicious-page.invalid suspicious\nsafe-page.invalid safe\ndown-page.invalid unavailable\n")
+    log_path = Path(tmp_dir) / "decision.log"
+    proc = start_proxy(log_path, {"PROXY_BLOCKLIST": str(block), "PROXY_REPUTATION_FIXTURE": str(fixture),
+                                  "PROXY_CONNECT_PORT": "443"}, tmp_dir, private_ok=False)  # SSRF protection ON
+    try:
+        pages = {}
+
+        def http_block(label, host):
+            raw = send_request(f"http://{host}/some/private/path?token=hunter2\n")
+            pages[label] = split_response(raw)
+
+        http_block("policy", "blocked-page.invalid")
+        http_block("reputation", "malicious-page.invalid")
+        http_block("network", "10.20.30.40")
+        s2, raw = open_tunnel("blocked-page.invalid:443")
+        pages["policy-connect"] = split_response(raw + s2.recv(4096) if b"</html>" not in raw else raw)
+        s2.close()
+        s2, raw = open_tunnel("malicious-page.invalid:443")
+        pages["reputation-connect"] = split_response(raw + (s2.recv(4096) if b"</html>" not in raw else b""))
+        s2.close()
+        s2, raw = open_tunnel("example.invalid:8443")  # a CONNECT to the wrong port
+        pages["port-connect"] = split_response(raw + (s2.recv(4096) if b"</html>" not in raw else b""))
+        s2.close()
+        s2, raw = open_tunnel("169.254.169.254:443")
+        pages["network-connect"] = split_response(raw + (s2.recv(4096) if b"</html>" not in raw else b""))
+        s2.close()
+        time.sleep(0.4)
+
+        expected = {"policy": "policy", "reputation": "reputation", "network": "network",
+                    "policy-connect": "policy", "reputation-connect": "reputation",
+                    "port-connect": "port", "network-connect": "network"}
+        bad = []
+        for label, reason in expected.items():
+            head, body = pages[label]
+            if not (head.startswith("HTTP/1.1 403") and "text/html" in head and f'data-reason="{reason}"' in body):
+                bad.append(f"{label}: {head[:30]!r} {body[:60]!r}")
+        report("each block returns an HTML 403 page naming the right SAFE reason category (HTTP and CONNECT)",
+               not bad, "; ".join(bad))
+
+        texts = {r: pages[l][1] for l, r in [("policy", "policy"), ("reputation", "reputation"), ("network", "network"),
+                                              ("port-connect", "port")]}
+        report("policy, reputation, network and port blocks produce four DISTINGUISHABLE pages",
+               len(set(texts.values())) == 4)
+
+        log = log_path.read_text()
+        ids_ok = []
+        for label in expected:
+            head, body = pages[label]
+            m = re.search(r'id="request-id">(\d+)<', body)
+            h = re.search(r"X-Request-Id: (\d+)", head)
+            rid = m.group(1) if m else None
+            line = next((l for l in log.splitlines() if f" req={rid} " in l), "") if rid else ""
+            want = {"policy": "blocked_policy", "reputation": "blocked_reputation", "network": "blocked_private",
+                    "port": "blocked_port"}[expected[label]]
+            # the line for THIS id must be this very kind of block, so an off-by-one id cannot slip through
+            ids_ok.append(bool(rid) and h and h.group(1) == rid and f"decision={want} status=403" in line)
+        report("the request ID on every page (body and header) matches that request's server log line", all(ids_ok), ids_ok)
+
+        forbidden = ["127.", "10.20", "169.254", "10.", "malicious", "suspicious", "fixture", ".txt", "dp_block",
+                     "dp_rep", "blocked-page", "malicious-page", "example.invalid", "token", "hunter2", "private/path",
+                     "/tmp", "offline", "score", "risk", "rule", "provider", "dns", "metadata", tmp_dir]
+        leaks = sorted({w for l, (h, b) in pages.items() for w in forbidden if w.lower() in (h + b).lower()})
+        report("block pages never reveal rules, addresses, provider answers, file paths, the host or any URL part",
+               not leaks, f"leaked: {leaks}")
+
+        report("technical detail is in the server log: decision, reputation verdict and risk score",
+               "decision=blocked_policy status=403" in log and "decision=blocked_reputation status=403" in log
+               and "decision=blocked_private status=403" in log and "decision=blocked_port status=403" in log
+               and "rep=malicious" in log)
+        risk_of = lambda decision: sorted({re.search(r"risk=(\d+)", l).group(1) for l in log.splitlines()
+                                           if f"decision={decision} " in l and "risk=" in l})
+        report("risk scores are logged and documented: rules=100, malicious=90",
+               risk_of("blocked_policy") == ["100"] and risk_of("blocked_private") == ["100"]
+               and risk_of("blocked_port") == ["100"] and risk_of("blocked_reputation") == ["90"],
+               {d: risk_of(d) for d in ("blocked_policy", "blocked_private", "blocked_port", "blocked_reputation")})
+
+        # allowed-but-scored requests (these proceed and then fail DNS: the .invalid names cannot resolve)
+        for host in ("suspicious-page.invalid", "safe-page.invalid", "down-page.invalid"):
+            send_request(f"http://{host}/\n")
+        time.sleep(0.3)
+        log = log_path.read_text()
+        def line_for(rep_token):
+            return next((l for l in log.splitlines() if rep_token in l and "decision=bad_gateway" in l), "")
+        report("a suspicious host is allowed but scored 50, a safe one 0, an unavailable one 10",
+               "risk=50" in line_for("rep=suspicious") and "risk=0" in line_for("rep=safe")
+               and "risk=10" in line_for("rep=unavailable"),
+               [line_for("rep=suspicious"), line_for("rep=safe"), line_for("rep=unavailable")])
+        lines = [l for l in log.splitlines() if l]
+        report("every log line remains well formed with the new fields", all(LOG_LINE_RE.match(l) for l in lines),
+               [l for l in lines if not LOG_LINE_RE.match(l)][:2])
+        ok = send_request("this is not a url\n")
+        report("non-block errors (400) are unchanged plain text, not block pages",
+               b"400 Bad Request" in ok and b"<html" not in ok)
+    finally:
+        stop_proxy(proc)
+
+
 def test_policy_startup_errors(tmp_dir):
     env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
                PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
@@ -1037,6 +1144,7 @@ def main():
         test_policy_allowlist(tmp_dir)
         test_policy_startup_errors(tmp_dir)
         test_reputation(tmp_dir)
+        test_decision_pages(tmp_dir)
         test_response_cache(tmp_dir)
         test_connect_tunnel(tmp_dir)
         test_connect_real_tls(tmp_dir)

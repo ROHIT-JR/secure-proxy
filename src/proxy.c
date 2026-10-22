@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "cache.h"
+#include "decision.h"
 #include "logger.h"
 #include "origin_client.h"
 #include "policy.h"
@@ -205,14 +206,38 @@ static void drain_and_close(int client_fd) {
     close(client_fd);
 }
 
+/* The log "decision" word for each blocking reason. */
+static const char *blocked_label(DecisionReason r) {
+    switch (r) {
+        case REASON_POLICY: return "blocked_policy";
+        case REASON_NETWORK: return "blocked_private";
+        case REASON_REPUTATION: return "blocked_reputation";
+        case REASON_PORT: return "blocked_port";
+        case REASON_NONE: break;
+    }
+    return "blocked";
+}
+
+/* Sends the HTML block page: the request ID and a safe reason category, nothing else.
+ * The technical detail (which rule, address, or provider answer) is only in the server log. */
+static void send_block_page(int client_fd, unsigned long request_id, DecisionReason reason) {
+    char page[2048];
+    size_t n = decision_build_block_response(page, sizeof(page), request_id, reason);
+    if (n > 0) {
+        send_all(client_fd, page, n);
+    }
+}
+
 /* The single decision point for "may we talk to this destination at all?", shared by
  * plain HTTP requests and CONNECT tunnels so both obey exactly the same rules.
- * Returns 1 to proceed. On refusal it sets the log decision/status and returns 0. */
-static int destination_allowed(const char *host, const char **decision, int *status, LogExtras *extras) {
+ *
+ * It gathers the policy and reputation signals into `sig` and returns the combined, documented
+ * decision (see docs/risk-scoring.md). Later stages (network safety, tunnel port) add their own
+ * signals to the same `sig` and call decision_evaluate() again. */
+static Decision check_destination(const char *host, DecisionInputs *sig, LogExtras *extras) {
     if (policy_check_host(&g_policy, host) != POLICY_ALLOW) {
-        *decision = "blocked_policy";
-        *status = 403;
-        return 0;
+        sig->policy_denied = 1;
+        return decision_evaluate(sig);
     }
 
     /* Reputation: ask only about real hostnames. IP addresses and local names are never sent
@@ -220,6 +245,8 @@ static int destination_allowed(const char *host, const char **decision, int *sta
      * checks). Only the bare hostname leaves this function. */
     if (reputation_is_enabled() && !hostname_is_local_name(host) && !host_is_numeric_address(host)) {
         ReputationResult r = reputation_check(host);
+        sig->reputation_checked = 1;
+        sig->reputation = r.verdict;
         char token[48];
         snprintf(token, sizeof(token), "rep=%s", reputation_verdict_name(r.verdict));
         extras_add(extras, token);
@@ -229,13 +256,8 @@ static int destination_allowed(const char *host, const char **decision, int *sta
             snprintf(token, sizeof(token), "rep_reason=%s", reputation_reason_name(r.reason));
             extras_add(extras, token);
         }
-        if (r.verdict == REP_MALICIOUS) {
-            *decision = "blocked_reputation";
-            *status = 403;
-            return 0;
-        }
     }
-    return 1;
+    return decision_evaluate(sig);
 }
 
 /* Reads and discards the header lines that follow a CONNECT line, up to the blank line.
@@ -336,7 +358,8 @@ typedef struct {
 
 /* Handles one CONNECT request end to end. `line` has its CR/LF removed. The caller closes
  * client_fd. HTTPS is only ever tunnelled: no TLS termination, no certificates, no inspection. */
-static void handle_connect(int client_fd, const char *line, ConnectOutcome *out, LogExtras *extras) {
+static void handle_connect(int client_fd, unsigned long request_id, const char *line, ConnectOutcome *out,
+                           LogExtras *extras, DecisionInputs *sig, int *risk_known) {
     snprintf(out->host, sizeof(out->host), "-");
     out->decision = "bad_request";
     out->status = 400;
@@ -370,16 +393,21 @@ static void handle_connect(int client_fd, const char *line, ConnectOutcome *out,
     }
 
     /* Only the HTTPS port: CONNECT must not become a way to reach arbitrary services. */
+    *risk_known = 1;
     if (target.port != g_connect_port) {
-        send_error_response(client_fd, 403, "Forbidden",
-                            "403 Forbidden: CONNECT is only permitted to the HTTPS port.\n");
-        out->decision = "blocked_port";
+        sig->port_denied = 1;
+        Decision d = decision_evaluate(sig);
+        send_block_page(client_fd, request_id, d.reason);
+        out->decision = blocked_label(d.reason);
         out->status = 403;
         return;
     }
 
-    if (!destination_allowed(target.host, &out->decision, &out->status, extras)) {
-        send_error_response(client_fd, 403, "Forbidden", "403 Forbidden: Destination blocked by policy.\n");
+    Decision d = check_destination(target.host, sig, extras);
+    if (d.action == DECISION_BLOCK) {
+        send_block_page(client_fd, request_id, d.reason);
+        out->decision = blocked_label(d.reason);
+        out->status = 403;
         return;
     }
 
@@ -388,8 +416,10 @@ static void handle_connect(int client_fd, const char *line, ConnectOutcome *out,
     int origin_fd = -1;
     FetchStatus conn = origin_connect(target.host, target.port, &origin_fd);
     if (conn == FETCH_ERR_UNSAFE_ADDRESS) {
-        send_error_response(client_fd, 403, "Forbidden", "403 Forbidden: Destination address is not permitted.\n");
-        out->decision = "blocked_private";
+        sig->network_unsafe = 1;
+        d = decision_evaluate(sig);
+        send_block_page(client_fd, request_id, d.reason);
+        out->decision = blocked_label(d.reason);
         out->status = 403;
         return;
     }
@@ -453,6 +483,9 @@ static void *handle_client(void *arg) {
     FetchStats stats;
     memset(&stats, 0, sizeof(stats));
     ConnectOutcome connect_outcome; /* function scope: log_host may point into it until cleanup */
+    DecisionInputs sig;             /* every signal gathered about this request, for the risk score */
+    memset(&sig, 0, sizeof(sig));
+    int risk_known = 0;             /* 1 once the destination checks have run */
 
     struct timeval timeout;
     timeout.tv_sec = CLIENT_READ_TIMEOUT_SECONDS;
@@ -491,7 +524,7 @@ static void *handle_client(void *arg) {
 
     if (request_is_connect(line)) {
         extras_add(&extras, "method=connect");
-        handle_connect(client_fd, line, &connect_outcome, &extras);
+        handle_connect(client_fd, request_id, line, &connect_outcome, &extras, &sig, &risk_known);
         log_host = connect_outcome.host;
         log_decision = connect_outcome.decision;
         log_status = connect_outcome.status;
@@ -515,9 +548,12 @@ static void *handle_client(void *arg) {
 
     /* Policy is applied BEFORE any DNS lookup or outbound connection, so a
      * blocked destination is never even resolved. */
-    if (!destination_allowed(parsed.host, &log_decision, &log_status, &extras)) {
-        send_error_response(client_fd, 403, "Forbidden",
-                            "403 Forbidden: Destination blocked by policy.\n");
+    risk_known = 1;
+    Decision dest = check_destination(parsed.host, &sig, &extras);
+    if (dest.action == DECISION_BLOCK) {
+        send_block_page(client_fd, request_id, dest.reason);
+        log_decision = blocked_label(dest.reason);
+        log_status = 403;
         goto cleanup;
     }
 
@@ -567,10 +603,11 @@ static void *handle_client(void *arg) {
      * response on the wire; sending another response on top of that
      * would corrupt the stream, so we just stop. */
     if (fetch_status == FETCH_ERR_UNSAFE_ADDRESS) {
-        /* Deliberately generic: never reveal which address a name resolved to. */
-        send_error_response(client_fd, 403, "Forbidden",
-                            "403 Forbidden: Destination address is not permitted.\n");
-        log_decision = "blocked_private";
+        /* Deliberately generic: the page names only a safe category, never the address. */
+        sig.network_unsafe = 1;
+        Decision net = decision_evaluate(&sig);
+        send_block_page(client_fd, request_id, net.reason);
+        log_decision = blocked_label(net.reason);
         log_status = 403;
     } else if (fetch_status == FETCH_ERR_DNS || fetch_status == FETCH_ERR_CONNECT) {
         char body[256];
@@ -595,6 +632,11 @@ cleanup:;
     free(stats.capture); /* NULL on every path except an early exit after a capture started */
     if (cache_state != NULL) {
         extras_add(&extras, cache_state);
+    }
+    if (risk_known) {
+        char risk_token[24];
+        snprintf(risk_token, sizeof(risk_token), "risk=%d", decision_evaluate(&sig).risk_score);
+        extras_add(&extras, risk_token);
     }
     log_request_ex(request_id, log_host, log_decision, log_status, log_bytes, duration_ms, extras.text);
 

@@ -37,7 +37,7 @@ Each request produces exactly one line of space-separated `key=value` fields (ea
 | `status` | The HTTP (Hypertext Transfer Protocol) status code: the origin's status when a page was forwarded, or the proxy's own error code. `0` means "no response was sent". |
 | `bytes` | Bytes of origin response forwarded to the client. Always `0` for errors the proxy generates itself. |
 | `duration_ms` | Time spent handling the request, in milliseconds. |
-| *extras* (optional) | Extra `key=value` fields after `duration_ms`. Today `cache=hit\|stored\|miss\|bypass` (see [`cache.md`](cache.md)) `method=connect` (see [`https-tunnelling.md`](https-tunnelling.md)) and `rep=safe|suspicious|malicious|unavailable`, plus `rep_reason=...` when unavailable (see [`reputation.md`](reputation.md)). Extras are always fixed tokens chosen by the proxy, never client data. |
+| *extras* (optional) | Extra `key=value` fields after `duration_ms`. Today `cache=hit\|stored\|miss\|bypass` (see [`cache.md`](cache.md)) `method=connect` (see [`https-tunnelling.md`](https-tunnelling.md)) and `rep=safe|suspicious|malicious|unavailable`, plus `rep_reason=...` when unavailable (see [`reputation.md`](reputation.md)), and `risk=0..100`, the combined risk score (see [`risk-scoring.md`](risk-scoring.md)). Extras are always fixed tokens chosen by the proxy, never client data. |
 
 ### Decision values
 
