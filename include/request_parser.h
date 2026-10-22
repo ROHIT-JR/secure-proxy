@@ -41,4 +41,25 @@ ParseStatus parse_http_url(const char *raw_url, ParsedUrl *out);
  */
 const char *parse_status_to_string(ParseStatus status);
 
+typedef struct {
+    char host[MAX_HOST_LEN]; /* lowercased */
+    uint16_t port;
+} ParsedConnect;
+
+/* Returns true if the line starts with "CONNECT " (the method is case-sensitive). */
+bool request_is_connect(const char *line);
+
+/**
+ * Parses "CONNECT host:port [HTTP/1.0|HTTP/1.1]" safely. The line must already have
+ * its trailing CR/LF removed. Rejects: a missing or non-numeric port, port 0 or above
+ * 65535, an empty or overlong host, credentials ('@'), paths, IPv6 brackets, control
+ * characters or spaces inside the target, extra tokens, and any version other than
+ * HTTP/1.0 or HTTP/1.1.
+ *
+ * @return PARSE_OK, or PARSE_ERR_MALFORMED / PARSE_ERR_EMPTY_HOST / PARSE_ERR_INVALID_HOST /
+ *         PARSE_ERR_INVALID_PORT / PARSE_ERR_CONTROL_CHAR / PARSE_ERR_OVERLONG /
+ *         PARSE_ERR_CREDENTIALS.
+ */
+ParseStatus parse_connect_request(const char *line, ParsedConnect *out);
+
 #endif /* REQUEST_PARSER_H */

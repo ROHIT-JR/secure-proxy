@@ -48,7 +48,7 @@ The project is split into two milestones:
 - Allowlist/blocklist policy engine, checked before any DNS lookup — **implemented**, see [`docs/policy.md`](docs/policy.md).
 - SSRF (Server-Side Request Forgery) protection: rejects loopback, private, link-local, and other unsafe addresses, re-checked at connect time — **implemented**, see the "Allowed-network policy" in [`docs/threat-model.md`](docs/threat-model.md).
 - Thread-safe bounded response cache (LRU eviction) that never caches cookies, credentials, or query-string URLs — **implemented**, see [`docs/cache.md`](docs/cache.md).
-- HTTPS `CONNECT` tunnelling with byte relay only — no interception, no decryption.
+- HTTPS `CONNECT` tunnelling with byte relay only — no interception, no decryption — **implemented**, see [`docs/https-tunnelling.md`](docs/https-tunnelling.md).
 - Pluggable `ReputationProvider` interface with an offline fixture provider for deterministic tests, and an optional live threat-feed adapter.
 - Explainable risk scoring with a safe, non-sensitive decision page.
 

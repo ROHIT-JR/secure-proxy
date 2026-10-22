@@ -37,7 +37,7 @@ Each request produces exactly one line of space-separated `key=value` fields (ea
 | `status` | The HTTP (Hypertext Transfer Protocol) status code: the origin's status when a page was forwarded, or the proxy's own error code. `0` means "no response was sent". |
 | `bytes` | Bytes of origin response forwarded to the client. Always `0` for errors the proxy generates itself. |
 | `duration_ms` | Time spent handling the request, in milliseconds. |
-| *extras* (optional) | Extra `key=value` fields after `duration_ms`. Today only `cache=hit\|stored\|miss\|bypass`, see [`cache.md`](cache.md). Extras are always fixed tokens chosen by the proxy, never client data. |
+| *extras* (optional) | Extra `key=value` fields after `duration_ms`. Today `cache=hit\|stored\|miss\|bypass` (see [`cache.md`](cache.md)) and `method=connect` (see [`https-tunnelling.md`](https-tunnelling.md)). Extras are always fixed tokens chosen by the proxy, never client data. |
 
 ### Decision values
 
@@ -52,6 +52,9 @@ Each request produces exactly one line of space-separated `key=value` fields (ea
 | `overloaded` | The 64-client concurrency limit was reached (503). |
 | `client_closed` | The client connected and disconnected without sending a request (for example a port scan or health check). |
 | `internal_error` | The proxy could not allocate memory or start a worker thread. |
+| `blocked_policy` | The host is on the blocklist, or not on the allowlist ([`policy.md`](policy.md)) (403). |
+| `blocked_private` | The destination is, or resolves to, a loopback/private/link-local/other unsafe address (403). |
+| `blocked_port` | A `CONNECT` asked for a port other than the HTTPS port (403). |
 
 > Later Phase 2 issues add more decisions (for example `blocked_policy` and `blocked_private_address`). The format does not change.
 

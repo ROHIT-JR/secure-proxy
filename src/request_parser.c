@@ -168,3 +168,96 @@ ParseStatus parse_http_url(const char *raw_url, ParsedUrl *out) {
 
     return PARSE_OK;
 }
+bool request_is_connect(const char *line) {
+    return line != NULL && strncmp(line, "CONNECT ", 8) == 0;
+}
+
+ParseStatus parse_connect_request(const char *line, ParsedConnect *out) {
+    if (line == NULL || out == NULL) {
+        return PARSE_ERR_MALFORMED;
+    }
+    size_t len = strlen(line);
+    if (len > MAX_URL_LEN) {
+        return PARSE_ERR_OVERLONG;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char uc = (unsigned char)line[i];
+        if (uc < 32 || uc == 127) {
+            return PARSE_ERR_CONTROL_CHAR;
+        }
+    }
+    if (!request_is_connect(line)) {
+        return PARSE_ERR_MALFORMED;
+    }
+
+    const char *target = line + 8;
+    if (*target == ' ' || *target == '\0') {
+        return PARSE_ERR_EMPTY_HOST;
+    }
+    const char *end = target;
+    while (*end != '\0' && *end != ' ') {
+        end++;
+    }
+
+    /* optional " HTTP/1.x" and nothing after it */
+    if (*end == ' ') {
+        const char *ver = end + 1;
+        if (strcmp(ver, "HTTP/1.1") != 0 && strcmp(ver, "HTTP/1.0") != 0) {
+            return PARSE_ERR_MALFORMED;
+        }
+    }
+
+    size_t tlen = (size_t)(end - target);
+    const char *colon = NULL;
+    for (const char *c = target; c < end; c++) {
+        if (*c == '@') {
+            return PARSE_ERR_CREDENTIALS;
+        }
+        if (*c == '/' || *c == '?' || *c == '#' || *c == '[' || *c == ']') {
+            return PARSE_ERR_INVALID_HOST;
+        }
+        if (*c == ':') {
+            if (colon != NULL) {
+                return PARSE_ERR_MALFORMED; /* "host:443:1" (and unbracketed IPv6) */
+            }
+            colon = c;
+        }
+    }
+    if (colon == NULL) {
+        return PARSE_ERR_INVALID_PORT; /* CONNECT always needs an explicit port */
+    }
+
+    size_t host_len = (size_t)(colon - target);
+    if (host_len == 0) {
+        return PARSE_ERR_EMPTY_HOST;
+    }
+    if (host_len >= sizeof(out->host)) {
+        return PARSE_ERR_HOST_TOO_LONG;
+    }
+    for (size_t i = 0; i < host_len; i++) {
+        char ch = target[i];
+        if (!isalnum((unsigned char)ch) && ch != '.' && ch != '-' && ch != '_') {
+            return PARSE_ERR_INVALID_HOST;
+        }
+        out->host[i] = (char)tolower((unsigned char)ch);
+    }
+    out->host[host_len] = '\0';
+
+    const char *port_str = colon + 1;
+    size_t port_len = tlen - host_len - 1;
+    if (port_len == 0 || port_len > 5) {
+        return PARSE_ERR_INVALID_PORT;
+    }
+    unsigned long port_val = 0;
+    for (size_t i = 0; i < port_len; i++) {
+        if (!isdigit((unsigned char)port_str[i])) {
+            return PARSE_ERR_INVALID_PORT;
+        }
+        port_val = port_val * 10 + (unsigned long)(port_str[i] - '0');
+    }
+    if (port_val == 0 || port_val > 65535) {
+        return PARSE_ERR_INVALID_PORT;
+    }
+    out->port = (uint16_t)port_val;
+    return PARSE_OK;
+}
