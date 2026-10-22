@@ -342,8 +342,11 @@ static void test_fixture_provider(void) {
     size_t malformed = 0;
     CHECK(reputation_fixture_load(fx, qlog, &fixture, &malformed) == 0, "fixture loads");
     CHECK(malformed == 4, "4 malformed fixture lines counted (got %zu)", malformed);
-    CHECK(reputation_fixture_load("/nonexistent/fixture.txt", NULL, &fixture, NULL) == -1 || 1, "(loaded)");
-    reputation_fixture_load(fx, qlog, &fixture, &malformed);
+
+    ReputationProvider missing;
+    memset(&missing, 0, sizeof(missing));
+    CHECK(reputation_fixture_load("/nonexistent/fixture.txt", NULL, &missing, NULL) == -1 && missing.ctx == NULL,
+          "a missing fixture file is refused and allocates nothing");
 
     reputation_shutdown();
     reputation_test_set_time(0);
