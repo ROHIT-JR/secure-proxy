@@ -99,12 +99,16 @@ def write_rules(tmp_dir, name, text):
     return path
 
 
-def start_proxy(log_path, extra_env=None, tmp_dir=None):
+def start_proxy(log_path, extra_env=None, tmp_dir=None, private_ok=True):
     # Always pin both policy files so a test never depends on the working directory.
     env = dict(os.environ, PROXY_LOG_FILE=str(log_path))
     if tmp_dir is not None:
         env.setdefault("PROXY_ALLOWLIST", str(write_rules(tmp_dir, "empty_allow.txt", "# off\n")))
         env.setdefault("PROXY_BLOCKLIST", str(write_rules(tmp_dir, "empty_block.txt", "# none\n")))
+    env.pop("PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS", None)
+    if private_ok:
+        # TEST-ONLY override so the fixtures can live on 127.0.0.1. SSRF tests turn it off.
+        env["PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS"] = "1"
     env.update(extra_env or {})
     proc = subprocess.Popen(
         [str(PROXY_BIN)],
@@ -347,6 +351,108 @@ def test_policy_allowlist(tmp_dir):
         stop_proxy(proc)
 
 
+class ConnectionCounter:
+    """A bare TCP listener on 127.0.0.1 that only counts accepted connections. If the proxy
+    ever connects to a forbidden address, this count goes up -- far stronger evidence than
+    'the HTTP response said 403'."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.count = 0
+        self._stop = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        self.sock.settimeout(0.2)
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+                self.count += 1
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self._stop = True
+        self.sock.close()
+
+
+def test_ssrf_protection(tmp_dir):
+    counter = ConnectionCounter()
+    log_path = Path(tmp_dir) / "ssrf.log"
+    proc = start_proxy(log_path, tmp_dir=tmp_dir, private_ok=False)  # NO test override
+    try:
+        before_hits = origin_hits["count"]
+        p = counter.port
+        forbidden = {
+            "loopback literal": f"127.0.0.1:{p}",
+            "localhost name": f"localhost:{p}",
+            "LOCALHOST. (case, trailing dot)": f"LOCALHOST.:{p}",
+            "subdomain of .localhost": f"anything.localhost:{p}",
+            "decimal-integer loopback (2130706433)": f"2130706433:{p}",
+            "hex loopback (0x7f.1)": f"0x7f.1:{p}",
+            "octal loopback (017700000001)": f"017700000001:{p}",
+            "short loopback (127.1)": f"127.1:{p}",
+            "private 10.0.0.0/8": "10.255.255.254:80",
+            "private 172.16.0.0/12": "172.16.0.1:80",
+            "private 192.168.0.0/16": "192.168.1.1:80",
+            "link-local 169.254.0.0/16": "169.254.10.10:80",
+            "cloud metadata 169.254.169.254": "169.254.169.254:80",
+            "metadata as decimal (2852039166)": "2852039166:80",
+            "unspecified 0.0.0.0": "0.0.0.0:80",
+            "carrier-grade NAT 100.64.0.0/10": "100.64.0.1:80",
+            "multicast 224.0.0.1": "224.0.0.1:80",
+        }
+        bad = []
+        slow = []
+        for label, target in forbidden.items():
+            t0 = time.time()
+            resp = send_request(f"http://{target}/\n")
+            took = time.time() - t0
+            line = status_line_of(resp)
+            if not line.startswith("HTTP/1.1 403"):
+                bad.append(f"{label} -> {line}")
+            if took > 2.0:
+                slow.append(f"{label} took {took:.1f}s (looks like a connection attempt)")
+        report(f"{len(forbidden)} loopback/private/link-local/metadata destinations are all refused with 403",
+               not bad, "; ".join(bad))
+        report("refusals are immediate (no connect attempt / timeout)", not slow, "; ".join(slow))
+        time.sleep(0.3)
+        report("NO TCP connection was made to the forbidden local listener", counter.count == 0,
+               f"{counter.count} connection(s) reached 127.0.0.1:{p}")
+        report("the local origin server received no request", origin_hits["count"] == before_hits)
+
+        body = send_request(f"http://127.0.0.1:{p}/\n").decode(errors="replace")
+        report("403 body reveals no address details", "127." not in body.split("\r\n\r\n", 1)[1]
+               and str(p) not in body, body[-100:])
+        log = log_path.read_text()
+        report("refusals are logged as decision=blocked_private status=403",
+               "decision=blocked_private status=403" in log)
+        report("the logged host is only the validated host (no path/port/query)",
+               "host=127.0.0.1 decision=blocked_private" in log and "?" not in log)
+    finally:
+        stop_proxy(proc)
+        counter.close()
+
+
+def test_ssrf_override_is_loud(tmp_dir):
+    env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "o.log"),
+               PROXY_ALLOWLIST=str(write_rules(tmp_dir, "oa.txt", "# off\n")),
+               PROXY_BLOCKLIST=str(write_rules(tmp_dir, "ob.txt", "# none\n")),
+               PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS="1")
+    proc = subprocess.Popen([str(PROXY_BIN)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(0.6)
+    stop_proxy(proc)
+    err = proc.stderr.read().decode(errors="replace")
+    proc.stderr.close()
+    report("the testing-only SSRF override prints a loud warning at startup",
+           "SSRF protection is DISABLED" in err, err[-120:])
+
+
 def test_policy_startup_errors(tmp_dir):
     env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
                PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
@@ -380,6 +486,8 @@ def main():
         test_policy_blocklist(tmp_dir)
         test_policy_allowlist(tmp_dir)
         test_policy_startup_errors(tmp_dir)
+        test_ssrf_protection(tmp_dir)
+        test_ssrf_override_is_loud(tmp_dir)
     finally:
         stop_proxy(proxy_proc)  # no-op if already stopped
         httpd.shutdown()

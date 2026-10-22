@@ -51,3 +51,17 @@ PolicyDecision policy_check_host(const Policy *p, const char *host);
 
 /* Releases everything policy_load() allocated. Safe on a zeroed or already-freed Policy. */
 void policy_free(Policy *p);
+
+/* ---------- Network safety: SSRF (Server-Side Request Forgery) protection ---------- */
+
+/* Returns 1 if the proxy must never connect to this address: loopback, private,
+ * link-local (including the 169.254.169.254 cloud metadata address), multicast,
+ * unspecified, carrier-grade NAT, documentation/benchmark/reserved ranges, and
+ * any IPv6 form that embeds an unsafe IPv4 address (IPv4-mapped, NAT64, 6to4,
+ * IPv4-compatible). Unknown or malformed addresses are treated as unsafe. */
+int address_is_unsafe(const struct sockaddr *addr);
+
+/* Returns 1 for names that must be refused without any DNS lookup:
+ * "localhost" and anything under ".localhost" or ".local". Case and a
+ * trailing dot are ignored. */
+int hostname_is_local_name(const char *host);

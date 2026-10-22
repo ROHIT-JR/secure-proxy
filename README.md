@@ -46,7 +46,7 @@ The project is split into two milestones:
 ### Phase 2 — Security-Aware and More Valuable
 - Privacy-aware structured request logging (no credentials, query strings, fragments, or paths logged) — **implemented**, see [`docs/logging.md`](docs/logging.md).
 - Allowlist/blocklist policy engine, checked before any DNS lookup — **implemented**, see [`docs/policy.md`](docs/policy.md).
-- SSRF (Server-Side Request Forgery) protection: rejects loopback, private, link-local, and other unsafe addresses, re-checked at connect time.
+- SSRF (Server-Side Request Forgery) protection: rejects loopback, private, link-local, and other unsafe addresses, re-checked at connect time — **implemented**, see the "Allowed-network policy" in [`docs/threat-model.md`](docs/threat-model.md).
 - Thread-safe bounded response cache with a documented eviction policy.
 - HTTPS `CONNECT` tunnelling with byte relay only — no interception, no decryption.
 - Pluggable `ReputationProvider` interface with an offline fixture provider for deterministic tests, and an optional live threat-feed adapter.

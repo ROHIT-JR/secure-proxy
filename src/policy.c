@@ -205,3 +205,134 @@ void policy_free(Policy *p) {
     free(p->allow_rules);
     memset(p, 0, sizeof(*p));
 }
+
+/* ---------- Network safety: SSRF protection ---------- */
+
+#include <arpa/inet.h>
+#include <stdint.h>
+
+/* `ip` is in host byte order. */
+static int ipv4_is_unsafe(uint32_t ip) {
+    static const struct {
+        uint32_t net;
+        uint32_t mask;
+    } blocked[] = {
+        {0x00000000u, 0xFF000000u}, /* 0.0.0.0/8        "this" network / unspecified */
+        {0x0A000000u, 0xFF000000u}, /* 10.0.0.0/8       private (RFC 1918) */
+        {0x64400000u, 0xFFC00000u}, /* 100.64.0.0/10    carrier-grade NAT */
+        {0x7F000000u, 0xFF000000u}, /* 127.0.0.0/8      loopback */
+        {0xA9FE0000u, 0xFFFF0000u}, /* 169.254.0.0/16   link-local, cloud metadata */
+        {0xAC100000u, 0xFFF00000u}, /* 172.16.0.0/12    private (RFC 1918) */
+        {0xC0000000u, 0xFFFFFF00u}, /* 192.0.0.0/24     IETF protocol assignments */
+        {0xC0000200u, 0xFFFFFF00u}, /* 192.0.2.0/24     documentation */
+        {0xC0A80000u, 0xFFFF0000u}, /* 192.168.0.0/16   private (RFC 1918) */
+        {0xC6120000u, 0xFFFE0000u}, /* 198.18.0.0/15    benchmarking */
+        {0xC6336400u, 0xFFFFFF00u}, /* 198.51.100.0/24  documentation */
+        {0xCB007100u, 0xFFFFFF00u}, /* 203.0.113.0/24   documentation */
+        {0xE0000000u, 0xF0000000u}, /* 224.0.0.0/4      multicast */
+        {0xF0000000u, 0xF0000000u}, /* 240.0.0.0/4      reserved + 255.255.255.255 broadcast */
+    };
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        if ((ip & blocked[i].mask) == blocked[i].net) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t v4_from_bytes(const unsigned char *b) {
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+}
+
+static int ipv6_is_unsafe(const unsigned char *a) {
+    int all_zero_to_12 = 1, first_10_zero = 1;
+    for (int i = 0; i < 12; i++) {
+        if (a[i] != 0) {
+            all_zero_to_12 = 0;
+        }
+    }
+    for (int i = 0; i < 10; i++) {
+        if (a[i] != 0) {
+            first_10_zero = 0;
+        }
+    }
+
+    /* ::/96 covers "::" (unspecified), "::1" (loopback) and IPv4-compatible ::a.b.c.d */
+    if (all_zero_to_12) {
+        return 1;
+    }
+    /* ::ffff:a.b.c.d  IPv4-mapped: judge by the embedded IPv4 address */
+    if (first_10_zero && a[10] == 0xFF && a[11] == 0xFF) {
+        return ipv4_is_unsafe(v4_from_bytes(a + 12));
+    }
+    /* 64:ff9b::/96  NAT64: judge by the embedded IPv4 address */
+    static const unsigned char nat64[12] = {0x00, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (memcmp(a, nat64, 12) == 0) {
+        return ipv4_is_unsafe(v4_from_bytes(a + 12));
+    }
+    /* 64:ff9b:1::/48  local-use NAT64 */
+    if (a[0] == 0x00 && a[1] == 0x64 && a[2] == 0xFF && a[3] == 0x9B && a[4] == 0x00 && a[5] == 0x01) {
+        return 1;
+    }
+    /* 2002::/16  6to4: IPv4 address is in bytes 2..5 */
+    if (a[0] == 0x20 && a[1] == 0x02) {
+        return ipv4_is_unsafe(v4_from_bytes(a + 2));
+    }
+    /* 2001::/32  Teredo (embeds an obfuscated IPv4 and relays through it): refuse */
+    if (a[0] == 0x20 && a[1] == 0x01 && a[2] == 0x00 && a[3] == 0x00) {
+        return 1;
+    }
+    /* 2001:db8::/32  documentation */
+    if (a[0] == 0x20 && a[1] == 0x01 && a[2] == 0x0D && a[3] == 0xB8) {
+        return 1;
+    }
+    /* 100::/64  discard-only */
+    if (a[0] == 0x01 && a[1] == 0x00 && a[2] == 0 && a[3] == 0 && a[4] == 0 && a[5] == 0 && a[6] == 0 && a[7] == 0) {
+        return 1;
+    }
+    /* fc00::/7  unique local (private) */
+    if ((a[0] & 0xFE) == 0xFC) {
+        return 1;
+    }
+    /* fe80::/10 link-local, fec0::/10 deprecated site-local */
+    if (a[0] == 0xFE && ((a[1] & 0xC0) == 0x80 || (a[1] & 0xC0) == 0xC0)) {
+        return 1;
+    }
+    /* ff00::/8  multicast */
+    if (a[0] == 0xFF) {
+        return 1;
+    }
+    return 0;
+}
+
+int address_is_unsafe(const struct sockaddr *addr) {
+    if (addr == NULL) {
+        return 1;
+    }
+    if (addr->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+        return ipv4_is_unsafe(ntohl(sin->sin_addr.s_addr));
+    }
+    if (addr->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        return ipv6_is_unsafe(sin6->sin6_addr.s6_addr);
+    }
+    return 1; /* unknown family: never connect */
+}
+
+int hostname_is_local_name(const char *host) {
+    char norm[POLICY_HOST_MAX + 2];
+    normalize_host(host, norm, sizeof(norm));
+    if (strcmp(norm, "localhost") == 0) {
+        return 1;
+    }
+    size_t n = strlen(norm);
+    static const char *suffixes[] = {".localhost", ".local"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t sl = strlen(suffixes[i]);
+        if (n > sl && strcmp(norm + (n - sl), suffixes[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
