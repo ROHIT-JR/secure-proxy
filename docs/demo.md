@@ -15,6 +15,6 @@ The following sections will be completed once the corresponding issue is impleme
 - Cache hit (Issue 12) — *implemented; see [`docs/cache.md`](cache.md)*
 - Safe logs with no leaked secrets (Issue 9) — *implemented; see [`docs/logging.md`](logging.md) for the format, privacy guarantees, and a copy-paste demo*
 - Optional: HTTPS (Hypertext Transfer Protocol Secure) `CONNECT` tunnelling (Issue 13) — *implemented; see [`https-tunnelling.md`](https-tunnelling.md)*
-- Optional: offline reputation result (Issue 14) — *pending*
+- Optional: offline reputation result (Issue 14) — *implemented; see [`reputation.md`](reputation.md)*
 
 See `ISSUE_PLAN.md` for the full Issue 18 specification that will replace the placeholders above with exact commands and expected output.

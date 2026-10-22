@@ -31,6 +31,7 @@ This document describes what SecureBrowse protects, who it protects against, how
 - Logs record only the validated hostname — never credentials, query strings, fragments, paths, or the raw request line — are written with owner-only permissions, and cannot be interleaved or forged by hostile input (Issue 9; see `docs/logging.md`).
 - The cache never stores responses containing `Set-Cookie`, `Authorization`, unapproved cache-control directives, partial bodies, non-200 statuses, or responses to URLs with a query string; it is bounded (entries, bytes, per-entry size, lifetime) and consulted only after the policy and network-safety checks (Issue 12; see `docs/cache.md`).
 - `CONNECT` tunnels are limited to the HTTPS port, go through the same policy and network-safety checks as plain requests *before* the tunnel exists, are bounded by the worker limit and an idle timeout, and are relayed blindly: the bytes are never examined, stored or logged (Issue 13; see `docs/https-tunnelling.md`).
+- A slow, failing or hung reputation provider cannot stall the proxy: lookups have a timeout, a bound on outstanding calls, and a short failure cache, and "unavailable" is logged as an event instead of being treated as a verdict (Issue 14; see `docs/reputation.md`).
 - The reputation provider only ever receives the normalised hostname, never full URLs, credentials, or request bodies (Issue 14).
 - Every request has a maximum size and a connection timeout, so a slow or oversized client cannot tie up a worker thread indefinitely.
 
@@ -75,6 +76,6 @@ The client only ever sees `403 Forbidden: Destination address is not permitted.`
 
 ## Residual risks
 
-- A reputation provider marked "unavailable" is treated as an observable event, not an automatic block — an operator who wants fail-closed behavior on provider outage must configure that explicitly; the default is fail-open with logging.
+- A reputation provider marked "unavailable" is treated as an observable event, not an automatic block — there is currently **no fail-closed option**: when the provider is unavailable the request proceeds (fail-open) and the outage is logged as `rep=unavailable` with a reason. A configurable fail-closed mode is a possible future improvement.
 - Because HTTPS content is never inspected, SecureBrowse cannot detect malicious content carried over an otherwise-permitted HTTPS destination.
 - DNS-rebinding protection reduces but does not eliminate the race between "check" and "use"; a sufficiently fast rebind between the final check and `connect()` remains a theoretical (TOCTOU, Time-Of-Check-To-Time-Of-Use) risk, which is why the check is performed as close to connection time as practical.

@@ -355,6 +355,18 @@ static void test_numeric_spellings_resolve_to_unsafe(void) {
     }
 }
 
+static void test_numeric_address_detection(void) {
+    const char *numeric[] = {"127.0.0.1", "2130706433", "0x7f.1", "017700000001", "127.1", "8.8.8.8",
+                             "10.1", "0xc0a80101"};
+    for (size_t i = 0; i < sizeof(numeric) / sizeof(numeric[0]); i++) {
+        CHECK(host_is_numeric_address(numeric[i]) == 1, "\"%s\" is a numeric address", numeric[i]);
+    }
+    const char *names[] = {"example.com", "localhost", "a.b.test", "1.2.3.4.5", "999.1.1.1", "abc", "", "bad-host.test"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        CHECK(host_is_numeric_address(names[i]) == 0, "\"%s\" is not a numeric address", names[i]);
+    }
+}
+
 int main(void) {
     printf("=== Running Policy Unit Tests ===\n");
     test_exact_and_subdomain_blocking();
@@ -372,6 +384,7 @@ int main(void) {
     test_malformed_address_is_unsafe();
     test_local_names();
     test_numeric_spellings_resolve_to_unsafe();
+    test_numeric_address_detection();
     printf("Result: %d / %d tests passed successfully.\n", passed_tests, total_tests);
     return passed_tests == total_tests ? 0 : 1;
 }

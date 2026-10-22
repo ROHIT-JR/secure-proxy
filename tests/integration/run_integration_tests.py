@@ -889,6 +889,120 @@ def test_connect_blocks_private_networks(tmp_dir):
         counter.close()
 
 
+def test_reputation(tmp_dir):
+    fixture = write_rules(tmp_dir, "reputation_fixture.txt",
+                          "malicious-fixture.invalid malicious\n.bad-zone.invalid malicious\n"
+                          "suspicious-fixture.invalid suspicious\nsafe-fixture.invalid safe\n"
+                          "down-fixture.invalid unavailable\nslow-fixture.invalid timeout\n")
+    query_log = Path(tmp_dir) / "rep_queries.txt"
+    log_path = Path(tmp_dir) / "rep.log"
+    counter = ConnectionCounter()
+    proc = start_proxy(log_path, {"PROXY_REPUTATION_FIXTURE": str(fixture),
+                                  "PROXY_REPUTATION_QUERY_LOG": str(query_log),
+                                  "PROXY_REPUTATION_TIMEOUT_MS": "300",
+                                  "PROXY_CONNECT_PORT": str(counter.port)}, tmp_dir)
+    try:
+        def status(host, path="/"):
+            return status_line_of(send_request(f"http://{host}{path}\n"))
+
+        # a malicious verdict blocks BEFORE DNS (a name that cannot resolve would otherwise give 502)
+        report("malicious host -> 403 before any DNS lookup", status("malicious-fixture.invalid").startswith("HTTP/1.1 403"),
+               status("malicious-fixture.invalid"))
+        report("malicious subdomain rule (.bad-zone.invalid) covers any depth",
+               status("deep.er.bad-zone.invalid").startswith("HTTP/1.1 403"))
+        s2, resp = open_tunnel(f"malicious-fixture.invalid:{counter.port}")
+        report("a malicious host is also refused for CONNECT, before any tunnel", resp.startswith(b"HTTP/1.1 403"), resp[:40])
+        s2.close()
+        report("...and nothing connected out", counter.count == 0)
+
+        # every other verdict lets the request continue (it then fails DNS because .invalid cannot resolve)
+        for host, want in [("safe-fixture.invalid", "safe"), ("suspicious-fixture.invalid", "suspicious")]:
+            line = status(host)
+            report(f"{want} host is allowed to proceed (then 502: the .invalid name cannot resolve)",
+                   line.startswith("HTTP/1.1 502"), line)
+        t0 = time.time()
+        line = status("down-fixture.invalid")
+        report("provider 'unavailable' does NOT block the host (it proceeds)", line.startswith("HTTP/1.1 502"), line)
+
+        # a provider that answers 3 s late must not hold the proxy up
+        t0 = time.time()
+        line = status("slow-fixture.invalid")
+        took = time.time() - t0
+        report("a slow provider is cut off at the timeout and the request proceeds",
+               line.startswith("HTTP/1.1 502") and took < 1.5, f"{line} after {took:.2f}s")
+        ts = []
+
+        def worker():
+            t1 = time.time()
+            send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html\n")
+            ts.append(time.time() - t1)
+
+        slow_threads = [threading.Thread(target=lambda: status("slow-fixture.invalid")) for _ in range(5)]
+        for t in slow_threads:
+            t.start()
+        worker()
+        for t in slow_threads:
+            t.join()
+        report("normal requests are not held up while the provider is slow", ts and ts[0] < 1.0, ts)
+
+        time.sleep(0.3)
+        log = log_path.read_text()
+        report("verdicts are logged: rep=malicious with decision=blocked_reputation",
+               "decision=blocked_reputation status=403" in log and "rep=malicious" in log)
+        report("suspicious and safe verdicts are logged", "rep=suspicious" in log and "rep=safe" in log)
+        report("unavailable is an observable event with a reason (error / timeout)",
+               "rep=unavailable rep_reason=error" in log and "rep=unavailable rep_reason=timeout" in log)
+        lines = [l for l in log.splitlines() if l]
+        report("every log line stays well formed", all(LOG_LINE_RE.match(l) for l in lines),
+               [l for l in lines if not LOG_LINE_RE.match(l)][:2])
+
+        # PRIVACY: only the bare hostname may ever be sent to a provider
+        before = len(query_log.read_text().splitlines()) if query_log.exists() else 0
+        status("suspicious-fixture.invalid", "/private/path?token=very-secret&user=alice")
+        status("safe-fixture.invalid:8080", "/x")
+        send_request(f"http://127.0.0.1:{ORIGIN_PORT}/index.html?token=abc\n")
+        send_request(f"http://localhost:{ORIGIN_PORT}/index.html\n")
+        send_request("http://2130706433/\n")
+        time.sleep(0.3)
+        queries = query_log.read_text().splitlines()
+        odd = [q for q in queries if not re.fullmatch(r"[a-z0-9.\-]+", q)]
+        report("the provider was only ever sent bare lowercase hostnames (never a path, query, port or credential)",
+               not odd and queries, f"odd={odd[:3]}")
+        report("IP addresses and local names are never sent to a provider",
+               not any(q in ("127.0.0.1", "localhost", "2130706433") for q in queries), queries[-5:])
+        text = query_log.read_text()
+        report("no query/token/path material reached the provider",
+               all(w not in text for w in ("secret", "token", "alice", "private", "8080")))
+
+        # results are cached: asking again about the same host does not query the provider again
+        n = queries.count("suspicious-fixture.invalid")
+        status("suspicious-fixture.invalid")
+        status("suspicious-fixture.invalid")
+        time.sleep(0.2)
+        report("repeat requests are answered from the reputation cache (provider asked once)",
+               query_log.read_text().splitlines().count("suspicious-fixture.invalid") == n)
+    finally:
+        stop_proxy(proc)
+        counter.close()
+
+    # off by default: no provider configured -> no reputation field, nothing blocked
+    log2 = Path(tmp_dir) / "rep_off.log"
+    proc = start_proxy(log2, tmp_dir=tmp_dir)
+    try:
+        line = status_line_of(send_request("http://malicious-fixture.invalid/\n"))
+        time.sleep(0.2)
+        report("without PROXY_REPUTATION_FIXTURE reputation is off (no rep= field, host not blocked)",
+               line.startswith("HTTP/1.1 502") and "rep=" not in log2.read_text(), line)
+    finally:
+        stop_proxy(proc)
+
+    env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x2.log"),
+               PROXY_REPUTATION_FIXTURE=str(Path(tmp_dir) / "missing-fixture.txt"))
+    res = subprocess.run([str(PROXY_BIN)], env=env, capture_output=True, timeout=10)
+    report("an unreadable reputation fixture stops startup instead of running unchecked",
+           res.returncode != 0 and b"refusing to start" in res.stderr, f"rc={res.returncode}")
+
+
 def test_policy_startup_errors(tmp_dir):
     env = dict(os.environ, PROXY_LOG_FILE=str(Path(tmp_dir) / "x.log"),
                PROXY_BLOCKLIST=str(Path(tmp_dir) / "does-not-exist.txt"))
@@ -922,6 +1036,7 @@ def main():
         test_policy_blocklist(tmp_dir)
         test_policy_allowlist(tmp_dir)
         test_policy_startup_errors(tmp_dir)
+        test_reputation(tmp_dir)
         test_response_cache(tmp_dir)
         test_connect_tunnel(tmp_dir)
         test_connect_real_tls(tmp_dir)

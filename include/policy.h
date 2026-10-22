@@ -61,6 +61,10 @@ void policy_free(Policy *p);
  * IPv4-compatible). Unknown or malformed addresses are treated as unsafe. */
 int address_is_unsafe(const struct sockaddr *addr);
 
+/* Returns 1 if `host` is an IP address in ANY spelling the system resolver accepts
+ * (dotted, decimal, hex, octal, short forms). Never performs a DNS query. */
+int host_is_numeric_address(const char *host);
+
 /* Returns 1 for names that must be refused without any DNS lookup:
  * "localhost" and anything under ".localhost" or ".local". Case and a
  * trailing dot are ignored. */
