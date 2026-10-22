@@ -43,9 +43,10 @@ Saved response to example.com.html (approx. 1-2 KB, varies with the live page)
 > If your machine has no internet access (for example, in an isolated CI or sandbox environment), you can demonstrate the same flow against a local origin instead:
 > ```sh
 > cd tests/fixtures/webroot && python3 -m http.server 9195 &
-> cd - && ./bin/client http://127.0.0.1:9195/index.html
+> cd - && PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1 ./bin/proxy &   # start the proxy this way instead
+> ./bin/client http://127.0.0.1:9195/index.html
 > ```
-> This is exactly what `make test`'s integration suite does automatically (see Step 8).
+> Since Phase 2, the proxy refuses loopback (127.0.0.1) addresses by default (SSRF protection), so a local origin needs the testing-only `PROXY_UNSAFE_ALLOW_PRIVATE_NETWORKS=1` switch. The five-minute demo in [`demo.md`](demo.md) shows both modes side by side. This is exactly what `make test`'s integration suite does automatically (see Step 8).
 
 ## 4. Show simultaneous clients
 

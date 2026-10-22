@@ -96,3 +96,5 @@ bin/
 src/*.o
 *.dSYM/
 
+# Demo outputs: saved responses, logs, and the throw-away TLS certificate
+demo-out/

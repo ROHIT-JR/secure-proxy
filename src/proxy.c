@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +25,7 @@
 #include "request_parser.h"
 #include "util.h"
 
-#define LISTEN_PORT 8080
+#define DEFAULT_LISTEN_PORT 8080
 #define REQUEST_LINE_BUF_LEN (MAX_URL_LEN + 3) /* URL + '\r' + '\n' + '\0' */
 #define CLIENT_READ_TIMEOUT_SECONDS 5
 #define MAX_CONCURRENT_CLIENTS 64
@@ -72,6 +73,7 @@ static void on_stop_signal(int sig) {
     g_stop = 1;
 }
 
+static unsigned g_listen_port = DEFAULT_LISTEN_PORT;
 static unsigned g_connect_port = CONNECT_DEFAULT_PORT;
 static int g_tunnel_idle_seconds = TUNNEL_DEFAULT_IDLE_SECONDS;
 
@@ -88,7 +90,7 @@ typedef enum {
     LINE_BAD_BYTES /* the line contains a NUL byte */
 } ReadLineStatus;
 
-/* Creates, binds, and starts listening on a TCP socket for LISTEN_PORT.
+/* Creates, binds, and starts listening on a TCP socket for g_listen_port.
  * Exits the process on failure, since a listener that can't start has
  * nothing useful to serve. */
 static int create_listening_socket(void) {
@@ -112,7 +114,7 @@ static int create_listening_socket(void) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(LISTEN_PORT);
+    addr.sin_port = htons((uint16_t)g_listen_port);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -770,6 +772,17 @@ int main(void) {
         origin_client_set_timeouts(connect_s, read_s);
     }
 
+    const char *lp = getenv("PROXY_PORT");
+    if (lp != NULL && lp[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(lp, &endp, 10);
+        if (*endp != '\0' || v < 1 || v > 65535) {
+            fprintf(stderr, "proxy: error: PROXY_PORT must be a port number (1-65535)\n");
+            return EXIT_FAILURE;
+        }
+        g_listen_port = (unsigned)v;
+    }
+
     const char *cp = getenv("PROXY_CONNECT_PORT");
     if (cp != NULL && cp[0] != '\0') {
         char *endp = NULL;
@@ -837,7 +850,7 @@ int main(void) {
     }
 
     int listen_fd = create_listening_socket();
-    printf("proxy: listening on port %d\n", LISTEN_PORT);
+    printf("proxy: listening on port %u\n", g_listen_port);
     fflush(stdout); /* stdout is fully buffered when not a tty (e.g. redirected to a log file) */
 
     while (!g_stop) {
