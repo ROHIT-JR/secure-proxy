@@ -14,8 +14,22 @@
 #include "util.h"
 
 #define PROXY_HOST "127.0.0.1"
-#define PROXY_PORT 8080
+#define DEFAULT_PROXY_PORT 8080
 #define READ_CHUNK_SIZE 8192
+
+/* The proxy's port: 8080, or PROXY_PORT from the environment (the same variable the proxy uses). */
+static unsigned proxy_port(void) {
+    const char *e = getenv("PROXY_PORT");
+    if (e != NULL && e[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(e, &endp, 10);
+        if (*endp == '\0' && v >= 1 && v <= 65535) {
+            return (unsigned)v;
+        }
+        fprintf(stderr, "client: ignoring invalid PROXY_PORT, using %d\n", DEFAULT_PROXY_PORT);
+    }
+    return DEFAULT_PROXY_PORT;
+}
 
 static int connect_to_proxy(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -27,7 +41,7 @@ static int connect_to_proxy(void) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PROXY_PORT);
+    addr.sin_port = htons((uint16_t)proxy_port());
     if (inet_pton(AF_INET, PROXY_HOST, &addr.sin_addr) != 1) {
         fprintf(stderr, "client: invalid proxy address\n");
         close(fd);
@@ -66,13 +80,23 @@ static void derive_output_filename(const char *url, char *out, size_t out_len) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <http-url>\n", argv[0]);
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "usage: %s <http-url> [output-file]\n"
+                        "  Saves the proxy's response to output-file (default: <host>.html).\n"
+                        "  Set PROXY_PORT if the proxy is not listening on 8080.\n", argv[0]);
         return 2;
     }
 
     char filename[300];
-    derive_output_filename(argv[1], filename, sizeof(filename));
+    if (argc == 3) {
+        if (strlen(argv[2]) >= sizeof(filename)) {
+            fprintf(stderr, "client: output file name is too long\n");
+            return 2;
+        }
+        snprintf(filename, sizeof(filename), "%s", argv[2]);
+    } else {
+        derive_output_filename(argv[1], filename, sizeof(filename));
+    }
 
     FILE *out = fopen(filename, "wb");
     if (!out) {

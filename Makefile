@@ -102,6 +102,10 @@ test: $(TARGET) $(PROXY_TARGET) $(CLIENT_TARGET) $(TEST_TARGET) $(FETCH_TEST_TAR
 sanitize: CFLAGS += -fsanitize=address,undefined -g
 sanitize: clean all test
 
+# Runs the demo in docs/demo.md exactly as written and checks every result (safe to repeat).
+demo-check: all
+	python3 tests/demo/run_demo_check.py
+
 # Concurrent load against the normal build. Deterministic for a given seed:
 #   make load-test SEED=7
 SEED ?= 1
@@ -134,4 +138,4 @@ valgrind: clean all
 clean:
 	rm -rf $(BIN_DIR) src/*.o tests/*.o *.o
 
-.PHONY: all test sanitize clean load-test load-test-sanitize valgrind
+.PHONY: all test sanitize clean load-test load-test-sanitize valgrind demo-check
