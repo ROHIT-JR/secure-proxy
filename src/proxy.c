@@ -16,6 +16,7 @@
 
 #include "logger.h"
 #include "origin_client.h"
+#include "policy.h"
 #include "request_parser.h"
 
 #define LISTEN_PORT 8080
@@ -23,11 +24,16 @@
 #define CLIENT_READ_TIMEOUT_SECONDS 5
 #define MAX_CONCURRENT_CLIENTS 64
 #define DEFAULT_LOG_PATH "proxy.log"
+#define DEFAULT_ALLOWLIST_PATH "config/allowlist.txt"
+#define DEFAULT_BLOCKLIST_PATH "config/blocklist.txt"
 
 /* Heap-allocated per-connection arguments passed to worker threads */
 typedef struct {
     int client_fd;
 } ClientArgs;
+
+/* Allowlist/blocklist rules: loaded once at startup, then only read by worker threads. */
+static Policy g_policy;
 
 /* Concurrency tracking state */
 static pthread_mutex_t g_active_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -246,6 +252,16 @@ static void *handle_client(void *arg) {
 
     log_host = parsed.host; /* validated + lowercased by the parser */
 
+    /* Policy is applied BEFORE any DNS lookup or outbound connection, so a
+     * blocked destination is never even resolved. */
+    if (policy_check_host(&g_policy, parsed.host) != POLICY_ALLOW) {
+        send_error_response(client_fd, 403, "Forbidden",
+                            "403 Forbidden: Destination blocked by policy.\n");
+        log_decision = "blocked_policy";
+        log_status = 403;
+        goto cleanup;
+    }
+
     FetchStats stats;
     FetchStatus fetch_status = fetch_and_relay(&parsed, client_fd, &stats);
     log_bytes = stats.bytes_relayed;
@@ -303,6 +319,35 @@ int main(void) {
                 log_path);
     }
 
+    /* Policy files: an explicitly configured file that cannot be read is a hard error
+     * (fail closed -- never run with fewer rules than the operator asked for). A missing
+     * DEFAULT file only produces a warning so a fresh checkout still starts. */
+    const char *allow_env = getenv("PROXY_ALLOWLIST");
+    const char *block_env = getenv("PROXY_BLOCKLIST");
+    const char *allow_path = (allow_env && allow_env[0]) ? allow_env : DEFAULT_ALLOWLIST_PATH;
+    const char *block_path = (block_env && block_env[0]) ? block_env : DEFAULT_BLOCKLIST_PATH;
+    PolicyLoadReport report;
+    if (policy_load(&g_policy, allow_path, block_path, &report) != 0) {
+        fprintf(stderr, "proxy: out of memory loading policy files\n");
+        return EXIT_FAILURE;
+    }
+    if ((report.block_file_missing && block_env && block_env[0]) ||
+        (report.allow_file_missing && allow_env && allow_env[0])) {
+        fprintf(stderr, "proxy: error: a policy file given via PROXY_ALLOWLIST/PROXY_BLOCKLIST "
+                        "cannot be read; refusing to start with fewer rules than requested\n");
+        policy_free(&g_policy);
+        return EXIT_FAILURE;
+    }
+    if (report.block_file_missing) {
+        fprintf(stderr, "proxy: warning: blocklist '%s' not found; no hosts are blocked\n", block_path);
+    }
+    if (report.block_malformed + report.allow_malformed > 0) {
+        fprintf(stderr, "proxy: warning: ignored %zu malformed policy rule(s)\n",
+                report.block_malformed + report.allow_malformed);
+    }
+    printf("proxy: policy loaded: %zu block rule(s), %zu allow rule(s), allowlist mode %s\n",
+           g_policy.block_count, g_policy.allow_count, g_policy.allowlist_active ? "ON" : "off");
+
     int listen_fd = create_listening_socket();
     printf("proxy: listening on port %d\n", LISTEN_PORT);
     fflush(stdout); /* stdout is fully buffered when not a tty (e.g. redirected to a log file) */
@@ -359,5 +404,6 @@ int main(void) {
     }
 
     close(listen_fd);
+    policy_free(&g_policy);
     return 0;
 }
