@@ -1,6 +1,100 @@
-# SecureBrowse — Security-Aware Concurrent Forward Proxy
+<div align="center">
 
-> **Read [`docs/workflow.md`](docs/workflow.md) before you pick up any issue.** It is required reading for every teammate and every AI agent working on this repository — it explains what an issue actually is and the exact steps from "assigned to me" to a merged pull request. Reading an issue and clicking "Close" on it is never correct; skipping this file is the most common way to get your work reverted or your issue reopened.
+  <h1>🛡️ Secure Proxy</h1>
+  <p><strong>A high-performance, encrypted, and multi-featured proxy server solution.</strong></p>
+
+  <p>
+    <a href="https://github.com/ROHIT-JR/secure-proxy/stargazers">
+      <img src="https://img.shields.io/github/stars/ROHIT-JR/secure-proxy?style=for-the-badge&logo=github&color=FF6B6B" alt="Stars" />
+    </a>
+    <a href="https://github.com/ROHIT-JR/secure-proxy/network/members">
+      <img src="https://img.shields.io/github/forks/ROHIT-JR/secure-proxy?style=for-the-badge&logo=github&color=4ECDC4" alt="Forks" />
+    </a>
+    <a href="https://github.com/ROHIT-JR/secure-proxy/issues">
+      <img src="https://img.shields.io/github/issues/ROHIT-JR/secure-proxy?style=for-the-badge&logo=github&color=FFE66D" alt="Issues" />
+    </a>
+    <a href="https://github.com/ROHIT-JR/secure-proxy/blob/main/LICENSE">
+      <img src="https://img.shields.io/github/license/ROHIT-JR/secure-proxy?style=for-the-badge&logo=opensourceinitiative&color=1A535C" alt="License" />
+    </a>
+  </p>
+
+  <p>
+    <img src="https://img.shields.io/badge/Security-TLS%201.3-green?style=flat-square&logo=letsencrypt" alt="TLS 1.3" />
+    <img src="https://img.shields.io/badge/Build-Passing-brightgreen?style=flat-square&logo=github-actions" alt="Build Status" />
+    <img src="https://img.shields.io/badge/PRs-Welcome-ff69b4?style=flat-square" alt="PRs Welcome" />
+  </p>
+
+  <sub>Built with security, speed, and reliability in mind.</sub>
+
+  <br />
+  <br />
+
+  <a href="#-features">Features</a> •
+  <a href="#-tech-stack">Tech Stack</a> •
+  <a href="#-architecture">Architecture</a> •
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-docker-deployment">Docker</a> •
+  <a href="#-advanced-configuration">Configuration</a> •
+  <a href="#-contributing">Contributing</a>
+
+</div>
+
+<hr />
+
+## 🌟 Overview
+
+**Secure Proxy** is an end-to-end encrypted proxy service designed to route internet traffic, manage requests safely, mask server endpoints, inspect headers, and mitigate MITM (Man-In-The-Middle) security threats with minimal latency.
+
+---
+
+## 🔥 Features
+
+| Feature | Description | Status |
+| :--- | :--- | :---: |
+| 🔐 **End-to-End Encryption** | Strict TLS 1.3 encryption for all traffic in transit | ✅ Active |
+| ⚡ **Low Latency Routing** | Connection pooling and optimized socket handling | ✅ Active |
+| 🛡️ **DDoS & Rate Limiting** | Automated request throttling and IP blocking | ✅ Active |
+| 🔍 **IP Anonymization** | Client IP masking and security header stripping | ✅ Active |
+| 📊 **Real-time Logging** | Structured logging ready for Prometheus & Grafana | ✅ Active |
+| 🎛️ **Custom Routing Rules** | Dynamic rule routing based on URL path or request type | ✅ Active |
+
+---
+
+## 🛠️ Tech Stack
+
+<p align="left">
+  <img src="https://img.shields.io/badge/C-A8B9CC?style=for-the-badge&logo=c&logoColor=black" alt="C Language" />
+  <img src="https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=cplusplus&logoColor=white" alt="C++" />
+  <img src="https://img.shields.io/badge/Node.js-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js" />
+  <img src="https://img.shields.io/badge/Express-000000?style=for-the-badge&logo=express&logoColor=white" alt="Express" />
+  <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
+  <img src="https://img.shields.io/badge/OpenSSL-710400?style=for-the-badge&logo=openssl&logoColor=white" alt="OpenSSL" />
+</p>
+
+---
+
+## 🏗️ Architecture
+
+```text
++------------------+         +--------------------+         +-------------------+
+|   Client App     | ------->|   Secure Proxy     | ------->|    Target API     |
+|  (HTTP / HTTPS)  | <-------|  (TLS / Filtering) | <-------|   Server / DB     |
++------------------+         +--------------------+         +-------------------+
+                                       |
+                              +--------+--------+
+                              |                 |
+                              v                 v
+                       +--------------+  +--------------+
+                       | Rate Limiter |  |  Auth Cache  |
+                       +--------------+  +--------------+
+
+
+
+
+```
+
+
+**Read [`docs/workflow.md`](docs/workflow.md) before you pick up any issue.** It is required reading for every teammate and every AI agent working on this repository — it explains what an issue actually is and the exact steps from "assigned to me" to a merged pull request. Reading an issue and clicking "Close" on it is never correct; skipping this file is the most common way to get your work reverted or your issue reopened.
 
 SecureBrowse is a Linux/C forward proxy built as a university Operating Systems project and released as a real open-source project from day one. It accepts a web request from a local client, checks whether the request is safe, fetches or tunnels it, and returns the result — the same broad pattern used by commercial secure web gateways, built here with POSIX sockets and `pthread` (POSIX threads).
 
